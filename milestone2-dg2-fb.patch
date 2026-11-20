@@ -1,0 +1,854 @@
+diff --git a/kernel/IntelXe/IntelXeClient.cpp b/kernel/IntelXe/IntelXeClient.cpp
+index 2feef13..f7dc5b2 100644
+--- a/kernel/IntelXe/IntelXeClient.cpp
++++ b/kernel/IntelXe/IntelXeClient.cpp
+@@ -184,6 +184,10 @@ IOReturn IOAccelIntelXeClient::clientMemoryForType(UInt32 type, IOOptionBits *op
+ }
+ 
+ bool IntelXe::l2Flush() {
++	if (gXePlat && gXePlat->graphicsVerx100 < 2000) {
++		deviceWmb();
++		return true;
++	}
+ 	if (!forcewake(true)) return false;
+ 	wr(0xb404, 1);   // XE2_GLOBAL_INVAL
+ 	uint32_t last = 0;
+@@ -386,5 +390,45 @@ IOReturn IntelXe::callPlatformFunction(const OSSymbol *fn, bool wait, void *p1,
+ 		xeDispBoostIdle();
+ 		return kIOReturnSuccess;
+ 	}
++	if (fn && p1 && fn->isEqualTo("intelxeGetDeviceInfo")) {
++		struct IntelXeDeviceInfo {
++			uint32_t version;
++			uint32_t platform;
++			uint16_t deviceId;
++			uint16_t graphicsVerx100;
++			uint16_t mediaVerx100;
++			uint16_t displayVer;
++			uint8_t bar2Mapped;
++			uint8_t hasFlatCcs;
++			uint8_t hasDisplay;
++			uint8_t up;
++			uint64_t bar2Length;
++		};
++		auto *r = static_cast<IntelXeDeviceInfo *>(p1);
++		if (!r || r->version != 1) return kIOReturnBadArgument;
++		const XePlatformDesc *plat = gXePlat;
++		r->platform = plat ? (uint32_t)plat->platform : 0u;
++		r->deviceId = gXePlatId ? gXePlatId : devId;
++		r->graphicsVerx100 = plat ? plat->graphicsVerx100 : 0;
++		r->mediaVerx100 = plat ? plat->mediaVerx100 : 0;
++		uint16_t dv = 0;
++		if (!plat || plat->hasDisplay) {
++			switch (plat ? plat->platform : XE_PLATFORM_UNINITIALIZED) {
++			case XE_DG2: dv = 13; break;
++			case XE_METEORLAKE:
++			case XE_BATTLEMAGE: dv = 14; break;
++			case XE_LUNARLAKE: dv = 20; break;
++			case XE_PANTHERLAKE: dv = 30; break;
++			default: dv = (plat && plat->graphicsVerx100 < 1270) ? 12 : 14; break;
++			}
++		}
++		r->displayVer = dv;
++		r->bar2Mapped = bar2 ? 1 : 0;
++		r->hasFlatCcs = (plat && plat->hasFlatCcs) ? 1 : 0;
++		r->hasDisplay = (!plat || plat->hasDisplay) ? 1 : 0;
++		r->up = up ? 1 : 0;
++		r->bar2Length = bar2 ? (uint64_t)bar2->getLength() : 0ull;
++		return kIOReturnSuccess;
++	}
+ 	return IOService::callPlatformFunction(fn, wait, p1, p2, p3, p4);
+ }
+diff --git a/kernel/IntelXe/build.py b/kernel/IntelXe/build.py
+index 5001d7b..43679b9 100644
+--- a/kernel/IntelXe/build.py
++++ b/kernel/IntelXe/build.py
+@@ -135,7 +135,7 @@ def main():
+    CFBundleShortVersionString=VER,OSBundleCompatibleVersion='0.1.0',OSBundleLibraries=libs,
+    IOKitPersonalities={name:dict(CFBundleIdentifier=ident,IOClass=ioclass or name,IOProviderClass='IOPCIDevice',IOPCIMatch='0xe20b8086 0xe20c8086 0xe2118086 0xe2128086',**personality),
+     f'{name}-G31':dict(CFBundleIdentifier=ident,IOClass=ioclass or name,IOProviderClass='IOPCIDevice',IOPCIMatch=G31_TESTER_MATCH,**personality),
+-    **({f'{name}-DG2':dict(CFBundleIdentifier=ident,IOClass=ioclass or name,IOProviderClass='IOPCIDevice',IOPCIMatch=DG2_TESTER_MATCH,**personality)} if name=='IntelXe' else {}),
++    f'{name}-DG2':dict(CFBundleIdentifier=ident,IOClass=ioclass or name,IOProviderClass='IOPCIDevice',IOPCIMatch=DG2_TESTER_MATCH,**personality),
+     **{k:dict(CFBundleIdentifier=ident,**v) for k,v in more.items()}},**extra)
+   (bundle/'Info.plist').write_bytes(plistlib.dumps(info))
+   syms=subprocess.check_output(['xcrun','nm','-u',str(exe)],text=True)
+diff --git a/kernel/IntelXe/xe_core.cpp b/kernel/IntelXe/xe_core.cpp
+index 809c613..84e1e7a 100644
+--- a/kernel/IntelXe/xe_core.cpp
++++ b/kernel/IntelXe/xe_core.cpp
+@@ -9018,7 +9018,7 @@ int xeResume() {
+ // Scan-out and cursor buffers: contiguous VRAM inside the BAR window (the display reads it through GGTT PTEs IntelXeFB
+ // writes, the CPU through BAR2), held by a kernel BO until freed; zeroed by the copy engine if asked (waited for).
+ int xeDispVramAlloc(uint64_t size, uint32_t flags, uint64_t *dpa, void **cookie) {
+-	if (!gDev->up) return ENXIO;
++	if (!gDev || !gDev->up || !gDev->vramMap()) return ENXIO;
+ 	if (!size || size > (1ull << 30)) return EINVAL;
+ 	auto *bo = static_cast<XeBo *>(IOMallocZero(sizeof(XeBo)));
+ 	if (!bo) return ENOMEM;
+diff --git a/kernel/IntelXeFB/IntelXeFB.cpp b/kernel/IntelXeFB/IntelXeFB.cpp
+index 2415de7..d6bcfed 100644
+--- a/kernel/IntelXeFB/IntelXeFB.cpp
++++ b/kernel/IntelXeFB/IntelXeFB.cpp
+@@ -256,10 +256,42 @@ struct NMXPipeGamma {
+ 	unsigned int count;     // kGammaSize or 0
+ 	unsigned int lut[1024];
+ };
+-// DP AUX (Linux intel_dp_aux_regs.h, display 14 = no xe2lpd remap): A 0x64010, B 0x64110, USBC1-4 0x16f210 + n*0x200;
+-// five data registers follow each control register
++// DP AUX (Linux intel_dp_aux_regs.h):
++// Display 14+ (BMG): A 0x64010, B 0x64110, USBC1-4 0x16f210 + n*0x200 (AUX_POWER_REQUEST = bit 19).
++// Display 13 (DG2 / Xe_HPD): A 0x64010, B 0x64110, C 0x64210, USBC1 0x64310, D 0x64710; AUX power wells live in
++// ICL_PWR_WELL_CTL_AUX1/2 (indices 0..3 and 7), not DP_AUX_CH_CTL bit 19.
+ constexpr uint32_t kAuxCtl[6] = { 0x64010, 0x64110, 0x16f210, 0x16f410, 0x16f610, 0x16f810 };
+ constexpr const char *kAuxName[6] = { "A", "B", "USBC1", "USBC2", "USBC3", "USBC4" };
++constexpr uint32_t kAuxCtlDg2[5] = { 0x64010, 0x64110, 0x64210, 0x64310, 0x64710 };
++constexpr const char *kAuxNameDg2[5] = { "A", "B", "C", "USBC1", "D" };
++constexpr int kAuxPwIdxDg2[5] = { 0, 1, 2, 3, 7 };   // XELPD_PW_CTL_IDX_AUX_{A,B,C,USBC1,D_XELPD}
++constexpr uint32_t DC_STATE_EN = 0x45504;
++constexpr uint32_t HSW_PWR_WELL_CTL1 = 0x45400, HSW_PWR_WELL_CTL2 = 0x45404;
++constexpr uint32_t ICL_PWR_WELL_CTL_AUX1 = 0x45440, ICL_PWR_WELL_CTL_AUX2 = 0x45444;
++constexpr uint32_t kXePlatformDg2 = 7;   // XePlatform::XE_DG2
++struct IntelXeDeviceInfo {
++	uint32_t version;
++	uint32_t platform;
++	uint16_t deviceId;
++	uint16_t graphicsVerx100;
++	uint16_t mediaVerx100;
++	uint16_t displayVer;
++	uint8_t bar2Mapped;
++	uint8_t hasFlatCcs;
++	uint8_t hasDisplay;
++	uint8_t up;
++	uint64_t bar2Length;
++};
++static bool isDg2DeviceId(uint16_t id)
++{
++	static const uint16_t kIdsDG2[] = {
++		0x56a0, 0x56a1, 0x56a2, 0x56be, 0x56bf, 0x5690, 0x5691, 0x5692, 0x56a5,
++		0x56a6, 0x56b0, 0x56b1, 0x56ba, 0x56bb, 0x56bc, 0x56bd, 0x5693, 0x5694,
++		0x5695, 0x56a3, 0x56a4, 0x56b2, 0x56b3, 0x5696, 0x5697,
++	};
++	for (uint16_t x : kIdsDG2) if (x == id) return true;
++	return false;
++}
+ constexpr uint32_t AUX_SEND_BUSY = 1u << 31, AUX_DONE = 1u << 30, AUX_TIME_OUT_ERROR = 1u << 28, AUX_TIME_OUT_MAX = 3u << 26;
+ constexpr uint32_t AUX_RECEIVE_ERROR = 1u << 25, AUX_POWER_REQUEST = 1u << 19;
+ // SKL+ sync pulses as intel_dp_aux: fast-wake 18 (10 precharge + 8 preamble), normal 32 (16 + 16), each field = count - 1
+@@ -493,6 +525,9 @@ class IntelXeFramebuffer : public IOFramebuffer {
+ 	volatile bool fStopping = false;
+ 	volatile uint8_t *fRegs = nullptr;
+ 	IOPhysicalAddress fSurfPhys = 0;   // BAR2 physical base + the surface's VRAM address
++	uint16_t fDisplayVer = 14;
++	bool fIsDg2 = false;
++	bool fBar2Mapped = true;
+ 	uint32_t fWidth = 0, fHeight = 0, fRowBytes = 0, fSurf = 0, fRefresh16 = 60 << 16;
+ 	uint64_t fFrameNs = 16666667ull, fDpa = 0;
+ 	uint32_t fHT = 0, fVT = 0, fHSS = 0, fHSE = 0, fVSS = 0, fVSE = 0, fRefreshMilliHz = 60000;
+@@ -798,7 +833,7 @@ private:
+ 		FBLOG("display %s", off ? "asleep: plane off" : "awake: plane on");
+ 		// DPMS (debug.intelxefb_dpms=1): asleep also takes the output down -- transcoder, DDI, PLL off, the sink in D3 -- as
+ 		// Linux's crtc disable does; the wake is a full modeset at the same mode (dpmsWake). Off by default until tested.
+-		if (off && gDpms && fAux) {
++		if (off && gDpms && fAux && fDisplayVer >= 14) {
+ 			int r = linkAction(IntelXeLink::kPowerDown);
+ 			fDpmsDown = r == 0;
+ 			FBLOG("dpms: output %s (%d)", r ? "NOT powered down" : "powered down", r);
+@@ -806,6 +841,7 @@ private:
+ 	}
+ 	volatile bool fDpmsDown = false;
+ 	void dpmsWake() {
++		if (fDisplayVer < 14) { dispLock(); fBlanked = false; dispUnlock(); fDpmsDown = false; return; }
+ 		dispLock(); fBlanked = false; dispUnlock();
+ 		int r = linkAction(IntelXeLink::kModeset);
+ 		if (r) { FBLOG("dpms: wake modeset failed (%d), once more", r); IOSleep(200); r = linkAction(IntelXeLink::kModeset); }
+@@ -893,6 +929,7 @@ private:
+ 	// interrupt path (hpdWork) does. When the panel's own port goes away and comes back, its link is gone: retrain it on
+ 	// a thread call (about 150 ms, the sink's long-pulse case in intel_dp_detect / intel_dp_retrain_link).
+ 	void pollHpd() {
++		if (fDisplayVer < 14) return;
+ 		uint32_t live = rd(SDEISR) & kHpdPins;
+ 		if (live == fHpd) return;
+ 		FBLOG("hotplug: live ports 0x%08x -> 0x%08x (polled)", fHpd, live);
+@@ -903,7 +940,7 @@ private:
+ 		fHpd = live;
+ 		setProperty("IntelXeFBHotplugLive", live, 32);
+ 	}
+-	bool hpdPolling() const { return !fIrqOn || fHpdStormMask; }
++	bool hpdPolling() const { return fDisplayVer >= 14 && (!fIrqOn || fHpdStormMask); }
+ 	static void replugFire(thread_call_param_t p0, thread_call_param_t) {
+ 		IntelXeFramebuffer *me = (IntelXeFramebuffer *)p0;
+ 		if (me->fStopping || me->fDpmsDown) return;   // asleep with the output off: the wake modesets anyway
+@@ -975,6 +1012,7 @@ public:
+ 	// debug.intelxefb_mode: program a mode's plane and scaler without WindowServer (hardware test from a remote shell;
+ 	// WindowServer keeps drawing its own mode until it is told). setDisplayMode is the real path.
+ 	bool testMode(IODisplayModeID mode) {
++		if (fDisplayVer < 14 && mode != fMode) return false;
+ 		uint32_t w, h, vt;
+ 		if (!fRegs || fPipe < 0 || !modeSize(mode, &w, &h, &vt)) return false;
+ 		dispLock();
+@@ -999,6 +1037,7 @@ public:
+ 	}
+ 	int linkAction(int action) {
+ 		if (!fRegs || fPipe < 0) return -1;
++		if (fDisplayVer < 14) { FBLOG("link: C20 PHY link actions not supported on display %u", fDisplayVer); return -1; }
+ 		if (!fAux) { FBLOG("link: no AUX channel answered at start (no EDID), nothing to train over"); return -1; }
+ 		dispLock();
+ 		// the link actions take the transcoder down: VRR goes off first (as Linux disables it before a modeset) and
+@@ -1202,6 +1241,7 @@ public:
+ 		uint32_t w, h, vt, ext; uint64_t pclk;
+ 		if (depth != 0 || !modeLookup(mode, &w, &h, &vt, &pclk, &ext)) return kIOReturnUnsupported;
+ 		if (mode == fMode) return kIOReturnSuccess;
++		if (fDisplayVer < 14) return kIOReturnUnsupported;
+ 		// the cursor's coordinates come in the reported size (a HiDPI mode's scaled size); the plane runs the panel's
+ 		const uint32_t spaceW = w, spaceH = h;
+ 		if (progFind(mode)) { w = fWidth; h = fHeight; }   // accelerator backed: WindowServer scales on the GPU
+@@ -1448,12 +1488,14 @@ public:
+ 	// debug.intelxefb_hpd: 1 = a short pulse on the panel's pin, 2 = a long one, handled as if the sink had sent it
+ 	// (intel_hpd_trigger_irq); the interrupt itself is not involved. debug.intelxefb_hpdinfo: counters and the last result.
+ 	int hpdTrigger(int kind) {
++		if (fDisplayVer < 14) return ENOTSUP;
+ 		if (!fHpdPin || !fHpdCall || (kind != 1 && kind != 2)) return EINVAL;
+ 		OSBitOrAtomic(fHpdPin, kind == 2 ? &fHpdLong : &fHpdShort);
+ 		thread_call_enter(fHpdCall);
+ 		return 0;
+ 	}
+ 	int hpdInfo(char *b, int n) {
++		if (fDisplayVer < 14) return snprintf(b, (size_t)n, "HPD disabled on display %u (Milestone 2 GOP reuse)", fDisplayVer);
+ 		return snprintf(b, (size_t)n, "panel pin 0x%08x | interrupt %s (irq %d), storm-masked 0x%08x | interrupts %u: long %u short %u, "
+ 		                "storms %u | retrains %u failed %u (streak %u), sink IRQ vectors acked %u | SDEISR 0x%08x SDEIMR 0x%08x SDEIER 0x%08x "
+ 		                "SHOTPLUG_CTL_TC 0x%08x DDI 0x%08x SHPD_FILTER_CNT 0x%x (firmware 0x%x) | last: %s",
+@@ -1964,6 +2006,7 @@ IOReturn IntelXeFramebuffer::scanout(NMXScanout *r)
+ void IntelXeFramebuffer::vrrProbeCaps()
+ {
+ 	fVrrCapable = false;
++	if (fDisplayVer < 14) return;
+ 	if (!fEdidParse) { FBLOG("vrr: no EDID, not capable"); return; }
+ 	// drm_edid.c:6504 drm_get_monitor_range (v10m, fb/IntelXeEdid.cpp): EDID 1.4, continuous frequency, a range limits
+ 	// descriptor of the "range limits only" kind; min/max vertical rate with the 1.4 offset flags. v10l read the first
+@@ -1987,6 +2030,7 @@ void IntelXeFramebuffer::vrrProbeCaps()
+ // (the full vblank, intel_vrr_max_vblank_guardband; it keeps the vsync pulse inside the guardband for every mode).
+ bool IntelXeFramebuffer::vrrCompute(uint32_t vt)
+ {
++	if (fDisplayVer < 14) return false;
+ 	if (!fPclkCur || !fHT || !fVrrMinHz || !vt) return false;
+ 	const uint32_t hz = (uint32_t)(fPclkCur / ((uint64_t)fHT * vt));
+ 	if (hz + 1 < fVrrMinHz || hz > fVrrMaxHz + 1) { FBLOG("vrr: mode at %u Hz is outside the panel's %u-%u Hz", hz, fVrrMinHz, fVrrMaxHz); return false; }
+@@ -2008,6 +2052,7 @@ bool IntelXeFramebuffer::vrrCompute(uint32_t vt)
+ 
+ bool IntelXeFramebuffer::vrrEnableLocked()
+ {
++	if (fDisplayVer < 14) return false;
+ 	if (fVrrOn) return true;
+ 	if (!fVrrCapable || !fVrrAllowed || fPipe < 0 || !fRegs || !fFlipLock) return false;
+ 	const int t = fPipe;
+@@ -2055,7 +2100,7 @@ bool IntelXeFramebuffer::vrrEnableLocked()
+ 
+ void IntelXeFramebuffer::vrrDisableLocked(const char *why)
+ {
+-	if (fPipe < 0 || !fRegs || !fFlipLock) return;
++	if (fDisplayVer < 14 || fPipe < 0 || !fRegs || !fFlipLock) return;
+ 	const int t = fPipe;
+ 	if (!fVrrOn && !(rd(TRANS_VRR_CTL(t)) & VRR_CTL_VRR_ENABLE)) return;
+ 	// intel_vrr_tg_disable
+@@ -2089,6 +2134,7 @@ void IntelXeFramebuffer::vrrDisableLocked(const char *why)
+ 
+ int IntelXeFramebuffer::vrrSet(int on)
+ {
++	if (fDisplayVer < 14) return ENOTSUP;
+ 	if (!fRegs || fPipe < 0) return ENODEV;
+ 	if (on == 1 && !fVrrAllowed) return EPERM;
+ 	if (on == 1 && !fVrrCapable) return ENOTSUP;
+@@ -2218,19 +2264,21 @@ void IntelXeFramebuffer::irqHandle(uint32_t master)
+ 		const uint32_t sde = rd(SDEIIR);
+ 		if (sde) {
+ 			wr(SDEIIR, sde);
+-			const uint32_t tcTrig = sde & SDE_TC_HOTPLUG_MASK, ddiTrig = sde & SDE_DDI_HOTPLUG_MASK;
+-			uint32_t longs = 0;
+-			if (tcTrig) {
+-				const uint32_t v = rd(SHOTPLUG_CTL_TC);
+-				wr(SHOTPLUG_CTL_TC, v);
+-				for (int i = 0; i < 4; i++) if ((tcTrig & (1u << (24 + i))) && (v >> (4 * i)) & HPD_LONG) longs |= 1u << (24 + i);
+-			}
+-			if (ddiTrig) {
+-				const uint32_t v = rd(SHOTPLUG_CTL_DDI);
+-				wr(SHOTPLUG_CTL_DDI, v);
+-				for (int i = 0; i < 2; i++) if ((ddiTrig & (1u << (16 + i))) && (v >> (4 * i)) & HPD_LONG) longs |= 1u << (16 + i);
++			if (fDisplayVer >= 14) {
++				const uint32_t tcTrig = sde & SDE_TC_HOTPLUG_MASK, ddiTrig = sde & SDE_DDI_HOTPLUG_MASK;
++				uint32_t longs = 0;
++				if (tcTrig) {
++					const uint32_t v = rd(SHOTPLUG_CTL_TC);
++					wr(SHOTPLUG_CTL_TC, v);
++					for (int i = 0; i < 4; i++) if ((tcTrig & (1u << (24 + i))) && (v >> (4 * i)) & HPD_LONG) longs |= 1u << (24 + i);
++				}
++				if (ddiTrig) {
++					const uint32_t v = rd(SHOTPLUG_CTL_DDI);
++					wr(SHOTPLUG_CTL_DDI, v);
++					for (int i = 0; i < 2; i++) if ((ddiTrig & (1u << (16 + i))) && (v >> (4 * i)) & HPD_LONG) longs |= 1u << (16 + i);
++				}
++				if (tcTrig | ddiTrig) { fIrqHpd++; hpdIrq(tcTrig | ddiTrig, longs); }
+ 			}
+-			if (tcTrig | ddiTrig) { fIrqHpd++; hpdIrq(tcTrig | ddiTrig, longs); }
+ 		}
+ 	}
+ 	if (ctl & DE_MISC_IRQ) { const uint32_t v = rd(DE_MISC_IIR); if (v) wr(DE_MISC_IIR, v); }
+@@ -2246,6 +2294,7 @@ void IntelXeFramebuffer::irqHandle(uint32_t master)
+ // hpdReenable, intel_hpd_irq_storm_switch_to_polling / _reenable_work), then the pulses go to hpdWork (dig_port_work).
+ void IntelXeFramebuffer::hpdIrq(uint32_t pins, uint32_t longs)
+ {
++	if (fDisplayVer < 14) return;
+ 	const uint64_t now = mach_absolute_time();
+ 	uint64_t period; nanoseconds_to_absolutetime((uint64_t)kHpdStormPeriodMs * 1000000ull, &period);
+ 	uint32_t storm = 0;
+@@ -2276,7 +2325,7 @@ void IntelXeFramebuffer::hpdIrq(uint32_t pins, uint32_t longs)
+ 
+ void IntelXeFramebuffer::hpdReenable()
+ {
+-	if (fStopping) return;
++	if (fStopping || fDisplayVer < 14) return;
+ 	uint32_t was = 0;
+ 	if (fHpdImrLock) IOSimpleLockLock(fHpdImrLock);
+ 	was = fHpdStormMask;
+@@ -2354,7 +2403,7 @@ void IntelXeFramebuffer::hpdShortPulse()
+ // intel_dp_check_link_state). Long pulse with the port down: unplugged, logged; its return is the next long pulse.
+ void IntelXeFramebuffer::hpdWork()
+ {
+-	if (fStopping) return;
++	if (fStopping || fDisplayVer < 14) return;
+ 	const uint32_t longs = __atomic_exchange_n(&fHpdLong, 0u, __ATOMIC_ACQ_REL);
+ 	const uint32_t shorts = __atomic_exchange_n(&fHpdShort, 0u, __ATOMIC_ACQ_REL) & ~longs;   // a long pulse covers it
+ 	if (!(longs | shorts)) return;
+@@ -2407,46 +2456,53 @@ bool IntelXeFramebuffer::irqRegister(bool on)
+ 		wr(DE_PIPE_IER(p), rd(DE_PIPE_IER(p)) | PIPE_VBLANK | PIPE_FIFO_UNDERRUN);
+ 		wr(DE_PIPE_IMR(p), rd(DE_PIPE_IMR(p)) & ~(PIPE_VBLANK | PIPE_FIFO_UNDERRUN));
+ 		uint32_t tc = 0;
+-		uint32_t hctl = rd(SHOTPLUG_CTL_TC), dctl = rd(SHOTPLUG_CTL_DDI);
+-		if (!fHpdEnSaved) {   // the firmware's choice of pins, kept for every later registration (the wakes)
+-			fHpdEnTc = hctl & 0x8888u; fHpdEnDdi = dctl & 0x88u; fSouthChicken1Boot = rd(SOUTH_CHICKEN1); fHpdEnSaved = true;
+-		} else {
+-			if ((hctl & 0x8888u) != fHpdEnTc || (dctl & 0x88u) != fHpdEnDdi)
+-				FBLOG("hotplug: detection enables TC 0x%04x DDI 0x%02x (firmware's TC 0x%04x DDI 0x%02x, cleared by system sleep): set "
+-				      "again (mtp_ddi/tc_hpd_detection_setup)", hctl & 0x8888u, dctl & 0x88u, fHpdEnTc, fHpdEnDdi);
+-			const uint32_t sc = rd(SOUTH_CHICKEN1);
+-			if (sc != fSouthChicken1Boot) {   // HPD inversion lives here (mtp_hpd_invert): back to what the firmware had
+-				FBLOG("hotplug: SOUTH_CHICKEN1 0x%08x, firmware's 0x%08x: put back", sc, fSouthChicken1Boot);
+-				wr(SOUTH_CHICKEN1, fSouthChicken1Boot);
++		if (fDisplayVer >= 14) {
++			uint32_t hctl = rd(SHOTPLUG_CTL_TC), dctl = rd(SHOTPLUG_CTL_DDI);
++			if (!fHpdEnSaved) {   // the firmware's choice of pins, kept for every later registration (the wakes)
++				fHpdEnTc = hctl & 0x8888u; fHpdEnDdi = dctl & 0x88u; fSouthChicken1Boot = rd(SOUTH_CHICKEN1); fHpdEnSaved = true;
++			} else {
++				if ((hctl & 0x8888u) != fHpdEnTc || (dctl & 0x88u) != fHpdEnDdi)
++					FBLOG("hotplug: detection enables TC 0x%04x DDI 0x%02x (firmware's TC 0x%04x DDI 0x%02x, cleared by system sleep): set "
++					      "again (mtp_ddi/tc_hpd_detection_setup)", hctl & 0x8888u, dctl & 0x88u, fHpdEnTc, fHpdEnDdi);
++				const uint32_t sc = rd(SOUTH_CHICKEN1);
++				if (sc != fSouthChicken1Boot) {   // HPD inversion lives here (mtp_hpd_invert): back to what the firmware had
++					FBLOG("hotplug: SOUTH_CHICKEN1 0x%08x, firmware's 0x%08x: put back", sc, fSouthChicken1Boot);
++					wr(SOUTH_CHICKEN1, fSouthChicken1Boot);
++				}
+ 			}
++			hctl |= fHpdEnTc; dctl |= fHpdEnDdi;
++			for (int pin = 0; pin < 4; pin++) if (hctl & (0x8u << (4 * pin))) tc |= 1u << (24 + pin);   // TC1-4 detection enabled
++			// mtp_hpd_irq_setup: the 250 us HPD filter (the firmware leaves a longer one, which can swallow a short pulse),
++			// then the detection enables (writing the sticky pulse status back clears it) and SDEIIR cleared before the
++			// pins are unmasked
++			if (fShpdFilterBoot == ~0u) fShpdFilterBoot = rd(SHPD_FILTER_CNT);
++			wr(SHPD_FILTER_CNT, SHPD_FILTER_CNT_250);
++			wr(SHOTPLUG_CTL_TC, hctl);
++			wr(SHOTPLUG_CTL_DDI, dctl);
++			wr(SDEIIR, rd(SDEIIR) & (tc | SDE_DDI_HOTPLUG_MASK));
++			wr(SDEIER, rd(SDEIER) | tc);
++			if (fHpdImrLock) IOSimpleLockLock(fHpdImrLock);
++			wr(SDEIMR, rd(SDEIMR) & ~(tc & ~fHpdStormMask));
++			if (fHpdImrLock) IOSimpleLockUnlock(fHpdImrLock);
+ 		}
+-		hctl |= fHpdEnTc; dctl |= fHpdEnDdi;
+-		for (int pin = 0; pin < 4; pin++) if (hctl & (0x8u << (4 * pin))) tc |= 1u << (24 + pin);   // TC1-4 detection enabled
+-		// mtp_hpd_irq_setup: the 250 us HPD filter (the firmware leaves a longer one, which can swallow a short pulse),
+-		// then the detection enables (writing the sticky pulse status back clears it) and SDEIIR cleared before the
+-		// pins are unmasked
+-		if (fShpdFilterBoot == ~0u) fShpdFilterBoot = rd(SHPD_FILTER_CNT);
+-		wr(SHPD_FILTER_CNT, SHPD_FILTER_CNT_250);
+-		wr(SHOTPLUG_CTL_TC, hctl);
+-		wr(SHOTPLUG_CTL_DDI, dctl);
+-		wr(SDEIIR, rd(SDEIIR) & (tc | SDE_DDI_HOTPLUG_MASK));
+-		wr(SDEIER, rd(SDEIER) | tc);
+-		if (fHpdImrLock) IOSimpleLockLock(fHpdImrLock);
+-		wr(SDEIMR, rd(SDEIMR) & ~(tc & ~fHpdStormMask));
+-		if (fHpdImrLock) IOSimpleLockUnlock(fHpdImrLock);
+ 		fIrqVblLast = fIrqVbl; fIrqMiss = 0;
+ 		fIrqOn = true;
+ 		wr(GEN11_DISPLAY_INT_CTL, DISPLAY_IRQ_ENABLE);
+-		FBLOG("display irq: vblank (pipe %c) and hotplug (SDE 0x%08x, panel pin 0x%08x, filter 0x%x -> 0x%x) interrupts on",
+-		      'A' + p, tc, fHpdPin, fShpdFilterBoot, SHPD_FILTER_CNT_250);
++		if (fDisplayVer >= 14)
++			FBLOG("display irq: vblank (pipe %c) and hotplug (SDE 0x%08x, panel pin 0x%08x, filter 0x%x -> 0x%x) interrupts on",
++			      'A' + p, tc, fHpdPin, fShpdFilterBoot, SHPD_FILTER_CNT_250);
++		else
++			FBLOG("display irq: vblank (pipe %c) interrupts on (HPD off on display %u)", 'A' + p, fDisplayVer);
+ 		return true;
+ 	}
+ 	fIrqOn = false;
+ 	wr(GEN11_DISPLAY_INT_CTL, 0);
+ 	wr(DE_PIPE_IMR(p), rd(DE_PIPE_IMR(p)) | PIPE_FIFO_UNDERRUN);   // as the firmware left it: vblank unmasked, nothing enabled
+ 	wr(DE_PIPE_IER(p), rd(DE_PIPE_IER(p)) & ~(PIPE_VBLANK | PIPE_FIFO_UNDERRUN));
+-	wr(SDEIER, rd(SDEIER) & ~SDE_TC_HOTPLUG_MASK);
+-	wr(SDEIMR, rd(SDEIMR) | SDE_TC_HOTPLUG_MASK);
++	if (fDisplayVer >= 14) {
++		wr(SDEIER, rd(SDEIER) & ~SDE_TC_HOTPLUG_MASK);
++		wr(SDEIMR, rd(SDEIMR) | SDE_TC_HOTPLUG_MASK);
++	}
+ 	if (fIntelXe && sym) (void)fIntelXe->callPlatformFunction(sym, false, &r, nullptr, nullptr, nullptr);   // none in flight after this
+ 	if (sym) sym->release();
+ 	FBLOG("display irq: off (%u vblank, %u hotplug, %u underrun interrupts)", fIrqVbl, fIrqHpd, fIrqUnderruns);
+@@ -2536,6 +2592,12 @@ int IntelXeFramebuffer::vrrInfo(char *b, int n)
+ {
+ 	const int t = fPipe;
+ 	if (t < 0 || !fRegs) return snprintf(b, (size_t)n, "no pipe");
++	if (fDisplayVer < 14) {
++		return snprintf(b, (size_t)n, "display %u: VRR disabled | sleep %u resume %u failed %u | irq %d calls %u vblank %u underrun %u | "
++		                "cursor ready %d image %d visible %d %ux%u images %u moves %u CURCNTR 0x%08x CURPOS 0x%08x",
++		                fDisplayVer, fSuspends, fResumes, fResumeFails, (int)fIrqOn, fIrqCalls, fIrqVbl, fIrqUnderruns,
++		                fCurReady, fCurHave, fCurVisible, fCurSrcW, fCurSrcH, fCurImages, fCurMoves, rd(CURCNTR(t)), rd(CURPOS(t)));
++	}
+ 	uint8_t ds = 0xFF; (void)dpcd(DP_DOWNSPREAD_CTRL, &ds, 1, false);
+ 	return snprintf(b, (size_t)n, "allowed %d capable %d on %d range %u-%u Hz vmin %u vmax %u guardband %u (%u-%u us) vbl %u tick %u lfc %d | "
+ 	                "VRR_CTL 0x%08x VMIN %u VMAX %u FLIPLINE %u STATUS 0x%08x STATUS2 %u VTOTAL_PREV 0x%08x PUSH 0x%08x VSYNC 0x%08x SDP_TL 0x%08x "
+@@ -2574,6 +2636,11 @@ bool IntelXeFramebuffer::cursorInit()
+ 	fCurSrc = (uint32_t *)IOMalloc(kCurBytes);
+ 	const bool own = cursorBufferAlloc(&fCurDpa, &fCurBo, &fCurMap);
+ 	if (!own) {
++		const uint64_t surfLen = (uint64_t)fRowBytes * fHeight;
++		if (kCurDpa < fDpa + surfLen && kCurDpa + kCurBytes > fDpa) {
++			FBLOG("cursor: fallback VRAM 0x%llx overlaps GOP surface 0x%llx..0x%llx", kCurDpa, fDpa, fDpa + surfLen - 1);
++			return false;
++		}
+ 		fCurDpa = kCurDpa;
+ 		if (IODeviceMemory *m = IODeviceMemory::withRange(fBarBase + kCurDpa, kCurBytes)) { fCurMap = m->map(kIOMapWriteCombineCache); m->release(); }
+ 	}
+@@ -2778,6 +2845,7 @@ IOReturn IntelXeFramebuffer::setCursorState(SInt32 x, SInt32 y, bool visible)
+ // (validateDetailedTiming) and enables VRR when such a timing is set (hwSetMode -> hwEnableVRR); this does the same.
+ const char *IntelXeFramebuffer::progCheck(const IODetailedTimingInformationV2 &t) const
+ {
++	if (fDisplayVer < 14) return "modeset not supported on DG2";
+ 	if (t.horizontalActive != fWidth || t.verticalActive != fHeight) return "active size";
+ 	if (t.horizontalActive + t.horizontalBlanking != fHT) return "horizontal total";
+ 	// syncs: the firmware's stay on the pipe (nothing reprograms them); a timing that names others (DisplayID's
+@@ -2825,7 +2893,7 @@ const char *IntelXeFramebuffer::progCheck(const IODetailedTimingInformationV2 &t
+ void IntelXeFramebuffer::publishScalerInfo()
+ {
+ 	fScalerPublished = false;
+-	if (!gHidpi) { removeProperty(kIOFBScalerInfoKey); return; }   // opt-in: intelxefb-hidpi=1
++	if (fDisplayVer < 14 || !gHidpi) { removeProperty(kIOFBScalerInfoKey); return; }   // opt-in: intelxefb-hidpi=1
+ 	if (!fScaling || fHomeOwned < 0 || !fCdclkKhz) { removeProperty(kIOFBScalerInfoKey); FBLOG("scaler: no HiDPI modes (scaling %d, home %d, cdclk %u)", (int)fScaling, fHomeOwned, fCdclkKhz); return; }
+ 	IODisplayScalerInformation si; bzero(&si, sizeof si);
+ 	si.scalerFeatures = kIOScaleCanDownSamplePixels;
+@@ -2975,7 +3043,7 @@ void IntelXeFramebuffer::applyVrrLocked(const char *why)
+ 
+ void IntelXeFramebuffer::publishTimingRange(bool on)
+ {
+-	if (!on || fPipe < 0 || !fPclk) { removeProperty(kIOFBTimingRangeKey); fRangePublished = false; return; }
++	if (fDisplayVer < 14 || !on || fPipe < 0 || !fPclk) { removeProperty(kIOFBTimingRangeKey); fRangePublished = false; return; }
+ 	IODisplayTimingRangeV2 r; bzero(&r, sizeof r);
+ 	r.version = kIOTimingRangeV2;
+ 	// EDID timings carry 10 kHz steps: 0.5 % headroom (as progCheck allows) so the firmware's own timing, rounded up to
+@@ -3030,7 +3098,7 @@ void IntelXeFramebuffer::publishTimingRange(bool on)
+ static void edidSum(uint8_t *blk) { uint8_t s = 0; for (int i = 0; i < 127; i++) s = (uint8_t)(s + blk[i]); blk[127] = (uint8_t)(0x100 - s); }
+ void IntelXeFramebuffer::vrrModesInit()
+ {
+-	if (!gVrrModes) return;
++	if (fDisplayVer < 14 || !gVrrModes) return;
+ 	char dummy[8];
+ 	if (fEdidLen >= 256 && fEdidLen + 128 <= kEdidMax && !intelxeBootArg("IntelXeFB", "-intelxefb_noedidfix", dummy, sizeof dummy)) {
+ 		const uint8_t *b = fEdid + 54;
+@@ -3173,22 +3241,22 @@ void IntelXeFramebuffer::vrrModesInit()
+ // then plane 1's DDB and watermarks. Saved before sleep, written back in this order after a wake that lost them
+ // (the GOP's values: no DMC here, DC states stay off). Pipe-relative entries are marked with bit 0 of the flags.
+ namespace {
+-struct CoreReg { uint32_t off; uint8_t pipe, wait; };   // wait: 1 power well pairs (state = request >> 1), 2 PLL lock, 3 DBUF state, 4 PMDEMAND
++struct CoreReg { uint32_t off; uint8_t pipe, wait, minVer; };   // wait: 1 power well pairs (state = request >> 1), 2 PLL lock, 3 DBUF state, 4 PMDEMAND
+ const CoreReg kCoreRegs[] = {
+-	{ 0x45504, 0, 0 },   // DC_STATE_EN
+-	{ 0x46408, 0, 0 },   // HSW_NDE_RSTWRN_OPT (PCH reset handshake)
+-	{ 0x45400, 0, 1 }, { 0x45404, 0, 1 },   // HSW_PWR_WELL_CTL1 (BIOS) / CTL2 (driver)
+-	{ 0x46070, 0, 2 },   // BXT_DE_PLL_ENABLE: CDCLK PLL ratio + enable
+-	{ 0x46008, 0, 0 }, { 0x46000, 0, 0 },   // CDCLK_SQUASH_CTL, CDCLK_CTL
+-	{ 0x45230, 0, 0 }, { 0x45234, 0, 4 },   // PMDEMAND request dwords (REQ_ENABLE on the second)
+-	{ 0x45008, 0, 3 }, { 0x44FE8, 0, 3 }, { 0x44300, 0, 3 }, { 0x44304, 0, 3 },   // DBUF_CTL_S0-3
+-	{ 0x45038, 0, 0 }, { 0x45048, 0, 0 }, { 0x4504C, 0, 0 }, { 0x4438C, 0, 0 },   // MBUS_ABOX0-2_CTL, MBUS_CTL
+-	{ 0x7003C, 1, 0 },   // PIPE_MBUS_DBOX_CTL
+-	{ 0x45130, 0, 0 }, { 0x45134, 0, 0 }, { 0x45140, 0, 0 }, { 0x45144, 0, 0 },   // BW_BUDDY0/1 CTL, PAGE_MASK
+-	{ 0x42084, 0, 0 },   // CHICKEN_MISC_2 (BMG_DARB_HALF_BLK_END_BURST)
+-	{ 0x7027C, 1, 0 },   // PLANE_BUF_CFG_1 (DDB)
+-	{ 0x70240, 1, 0 }, { 0x70244, 1, 0 }, { 0x70248, 1, 0 }, { 0x7024C, 1, 0 }, { 0x70250, 1, 0 }, { 0x70254, 1, 0 },
+-	{ 0x70258, 1, 0 }, { 0x7025C, 1, 0 }, { 0x70268, 1, 0 },   // PLANE_WM_1 levels 0-5, SAGV, SAGV_TRANS, TRANS
++	{ 0x45504, 0, 0, 13 },   // DC_STATE_EN
++	{ 0x46408, 0, 0, 13 },   // HSW_NDE_RSTWRN_OPT (PCH reset handshake)
++	{ 0x45400, 0, 1, 13 }, { 0x45404, 0, 1, 13 },   // HSW_PWR_WELL_CTL1 (BIOS) / CTL2 (driver)
++	{ 0x46070, 0, 2, 13 },   // BXT_DE_PLL_ENABLE: CDCLK PLL ratio + enable
++	{ 0x46008, 0, 0, 13 }, { 0x46000, 0, 0, 13 },   // CDCLK_SQUASH_CTL, CDCLK_CTL
++	{ 0x45230, 0, 0, 14 }, { 0x45234, 0, 4, 14 },   // PMDEMAND request dwords (Display 14+ only)
++	{ 0x45008, 0, 3, 13 }, { 0x44FE8, 0, 3, 13 }, { 0x44300, 0, 3, 14 }, { 0x44304, 0, 3, 14 },   // DBUF_CTL_S0-1 (DG2), S2-3 (Display 14+)
++	{ 0x45038, 0, 0, 13 }, { 0x45048, 0, 0, 13 }, { 0x4504C, 0, 0, 13 }, { 0x4438C, 0, 0, 13 },   // MBUS_ABOX0-2_CTL, MBUS_CTL
++	{ 0x7003C, 1, 0, 13 },   // PIPE_MBUS_DBOX_CTL
++	{ 0x45130, 0, 0, 13 }, { 0x45134, 0, 0, 13 }, { 0x45140, 0, 0, 13 }, { 0x45144, 0, 0, 13 },   // BW_BUDDY0/1 CTL, PAGE_MASK
++	{ 0x42084, 0, 0, 14 },   // CHICKEN_MISC_2 (BMG_DARB_HALF_BLK_END_BURST, Display 14+ only)
++	{ 0x7027C, 1, 0, 13 },   // PLANE_BUF_CFG_1 (DDB)
++	{ 0x70240, 1, 0, 13 }, { 0x70244, 1, 0, 13 }, { 0x70248, 1, 0, 13 }, { 0x7024C, 1, 0, 13 }, { 0x70250, 1, 0, 13 }, { 0x70254, 1, 0, 13 },
++	{ 0x70258, 1, 0, 13 }, { 0x7025C, 1, 0, 13 }, { 0x70268, 1, 0, 13 },   // PLANE_WM_1 levels 0-5, SAGV, SAGV_TRANS, TRANS
+ };
+ constexpr int kNumCoreRegs = (int)(sizeof kCoreRegs / sizeof kCoreRegs[0]);
+ static_assert(kNumCoreRegs <= 48, "core register table");
+@@ -3198,6 +3266,7 @@ void IntelXeFramebuffer::coreSaveRestore(bool restore)
+ {
+ 	if (fPipe < 0 || !fRegs) return;
+ 	for (int i = 0; i < kNumCoreRegs; i++) {
++		if (fDisplayVer < kCoreRegs[i].minVer) continue;
+ 		const uint32_t off = kCoreRegs[i].off + (kCoreRegs[i].pipe ? (uint32_t)fPipe * 0x1000u : 0u);
+ 		if (!restore) { fCoreSaved[i] = rd(off); continue; }
+ 		const uint32_t v = fCoreSaved[i];
+@@ -3291,6 +3360,10 @@ void IntelXeFramebuffer::powerEvent(uint32_t event)
+ 		}
+ 		coreSaveRestore(false);
+ 		pipeColorSave();
++		if (fDisplayVer < 14) {
++			FBLOG("system sleep: display %u core/color state saved (C20 link power-down skipped)", fDisplayVer);
++			return;
++		}
+ 		const int s = linkAction(IntelXeLink::kSave);
+ 		const int d = linkAction(IntelXeLink::kPowerDown);   // sink to D3 and the output off cleanly, as Linux's suspend
+ 		FBLOG("system sleep: display state saved (%d), output %s (%d)", s, d ? "NOT powered down" : "powered down", d);
+@@ -3325,10 +3398,16 @@ void IntelXeFramebuffer::resumeDisplay()
+ 	dispLock();
+ 	planeNoarm(fPipe);
+ 	dispUnlock();
+-	int r = linkAction(IntelXeLink::kRestore);
+-	if (r) { FBLOG("resume: restore modeset failed (%d), once more", r); IOSleep(200); r = linkAction(IntelXeLink::kRestore); }
+-	if (r) fResumeFails++;
+-	else fDpmsDown = false;                          // the restore modeset also brought a DPMS-off output back
++	int r = 0;
++	if (fDisplayVer >= 14) {
++		r = linkAction(IntelXeLink::kRestore);
++		if (r) { FBLOG("resume: restore modeset failed (%d), once more", r); IOSleep(200); r = linkAction(IntelXeLink::kRestore); }
++		if (r) fResumeFails++;
++		else fDpmsDown = false;                      // the restore modeset also brought a DPMS-off output back
++	} else {
++		fDpmsDown = false;
++		if (coreLost) FBLOG("resume: display %u core lost power (SNPS PHY restore deferred to Milestone 3)", fDisplayVer);
++	}
+ 	dispLock();
+ 	// plane registers, scaler, surface home; the plane's enable stays as display sleep left it (blank(false) on the
+ 	// display's own wake turns it on)
+@@ -3368,6 +3447,11 @@ IOService *IntelXeFramebuffer::probe(IOService *provider, SInt32 *score)
+ 	if (!pci) return nullptr;
+ 	if (bootArg("-intelxe_nofb") || bootArg("-intelxefb_off")) { FBLOG("off by boot-arg"); return nullptr; }
+ 	if (bootArg("-x")) { FBLOG("safe mode: not starting"); return nullptr; }
++	const uint16_t devId = pci->configRead16(kIOPCIConfigDeviceID);
++	if (isDg2DeviceId(devId) && !bootArg("-intelxe_allow_dg2_fb")) {
++		FBLOG("8086:%04x is DG2: framebuffer disabled (pass -intelxe_allow_dg2_fb to test)", devId);
++		return nullptr;
++	}
+ 	return IOFramebuffer::probe(provider, score);
+ }
+ 
+@@ -3541,13 +3625,15 @@ bool IntelXeFramebuffer::adoptFirmwareMode(IOPhysicalAddress barBase, IOPhysical
+ 				return false;
+ 			}
+ 		}
+-		if (fDpa + len > barLen) {
+-			FBLOG("pipe %c: surface at VRAM 0x%llx is past the %llu MiB BAR2 window", 'A' + p, fDpa, (unsigned long long)(barLen >> 20));
++		if (!len || len > (uint64_t)barLen || fDpa > (uint64_t)barLen - len) {
++			FBLOG("pipe %c: surface at VRAM 0x%llx (%llu bytes) is past the %llu MiB BAR2 window", 'A' + p, fDpa,
++			      (unsigned long long)len, (unsigned long long)(barLen >> 20));
+ 			return false;
+ 		}
+ 		fSurfPhys = barBase + fDpa;
+ 		fBarBase = barBase; fBarLen = barLen;
+ 		fPteFlags = first & ~kPteAddr;
++		if (fDisplayVer < 14) fPteFlags &= ~(1ull << 53);   // DG2 GGTT PTEs do not use Xe2's PAT bit 53
+ 		fHT = (rd(HTOTAL(p)) >> 16) + 1; fVT = (rd(VTOTAL(p)) >> 16) + 1; fModeVT = fVT;
+ 		fHSS = (rd(HSYNC(p)) & 0xFFFF) + 1; fHSE = (rd(HSYNC(p)) >> 16) + 1;
+ 		fVSS = (rd(VSYNC(p)) & 0xFFFF) + 1; fVSE = (rd(VSYNC(p)) >> 16) + 1;
+@@ -3591,7 +3677,7 @@ bool IntelXeFramebuffer::adoptFirmwareMode(IOPhysicalAddress barBase, IOPhysical
+ 		      fRefresh16 >> 16, ((fRefresh16 & 0xFFFF) * 100) >> 16);
+ 		return true;
+ 	}
+-	FBLOG("no pipe is scanning out (no monitor on the B580 at boot?)");
++	FBLOG("no pipe is scanning out (no monitor lit by UEFI GOP at boot?)");
+ 	return false;
+ }
+ 
+@@ -3599,6 +3685,11 @@ bool IntelXeFramebuffer::start(IOService *provider)
+ {
+ 	fPCI = OSDynamicCast(IOPCIDevice, provider);
+ 	if (!fPCI) return false;
++	const uint16_t devId = fPCI->configRead16(kIOPCIConfigDeviceID);
++	if (isDg2DeviceId(devId) && !bootArg("-intelxe_allow_dg2_fb")) {
++		FBLOG("8086:%04x is DG2: framebuffer disabled (pass -intelxe_allow_dg2_fb to test)", devId);
++		return false;
++	}
+ 	char dummy[8];
+ 	if (intelxeBootArg("IntelXeFB", "-intelxefb_noscale", dummy, sizeof(dummy))) { fScaling = false; FBLOG("scaled modes off by boot-arg"); }
+ 	if (intelxeBootArg("IntelXeFB", "-intelxefb_norates", dummy, sizeof(dummy))) { fRates = false; FBLOG("other refresh rates off by boot-arg"); }
+@@ -3618,9 +3709,72 @@ bool IntelXeFramebuffer::start(IOService *provider)
+ 	fPCI->setMemoryEnable(true);
+ 	fMMIO = fPCI->mapDeviceMemoryWithRegister(kIOPCIConfigBaseAddress0);
+ 	IODeviceMemory *ap = fPCI->getDeviceMemoryWithRegister(kIOPCIConfigBaseAddress2);
+-	if (!fMMIO || !ap || fMMIO->getLength() < kGsm + 0x800000) { FBLOG("BAR0 or BAR2 is not available"); OSSafeReleaseNULL(fMMIO); return false; }
++	if (!fMMIO || !ap || fMMIO->getLength() < kGsm + 0x800000 || !ap->getLength()) {
++		FBLOG("BAR0 or BAR2 is not available");
++		OSSafeReleaseNULL(fMMIO);
++		return false;
++	}
+ 	fRegs = (volatile uint8_t *)fMMIO->getVirtualAddress();
+-	if (!adoptFirmwareMode(ap->getPhysicalAddress(), ap->getLength())) { OSSafeReleaseNULL(fMMIO); fRegs = nullptr; return false; }
++	if (rd(0) == 0xFFFFFFFFu) {
++		FBLOG("BAR0 MMIO reads 0xffffffff: aborting cleanly before display init");
++		OSSafeReleaseNULL(fMMIO); fRegs = nullptr;
++		return false;
++	}
++	IntelXeDeviceInfo info = {};
++	info.version = 1;
++	IOReturn infoRr = kIOReturnUnsupported;
++	if (IOService *xe = intelxe()) {
++		if (const OSSymbol *sym = OSSymbol::withCString("intelxeGetDeviceInfo")) {
++			infoRr = xe->callPlatformFunction(sym, false, &info, nullptr, nullptr, nullptr);
++			sym->release();
++		}
++	}
++	if (infoRr == kIOReturnSuccess) {
++		fIsDg2 = (info.platform == kXePlatformDg2) || isDg2DeviceId(info.deviceId);
++		fDisplayVer = info.displayVer ? info.displayVer : (fIsDg2 ? 13 : 14);
++		fBar2Mapped = info.bar2Mapped != 0;
++		if (!info.hasDisplay) {
++			FBLOG("8086:%04x has no display engine: aborting", info.deviceId);
++			OSSafeReleaseNULL(fMMIO); OSSafeReleaseNULL(fIntelXe); fRegs = nullptr;
++			return false;
++		}
++		if (fIsDg2 && !fBar2Mapped) {
++			FBLOG("DG2 8086:%04x: BAR2 not mapped in IntelXe (Small-BAR / ResizeAppleGpuBars=-1): aborting to keep UEFI GOP console", info.deviceId);
++			OSSafeReleaseNULL(fMMIO); OSSafeReleaseNULL(fIntelXe); fRegs = nullptr;
++			return false;
++		}
++	} else {
++		fIsDg2 = isDg2DeviceId(devId);
++		fDisplayVer = fIsDg2 ? 13 : 14;
++		fBar2Mapped = true;
++	}
++	if (fDisplayVer < 14) {
++		fScaling = false; fRates = false; fCommonRates = false;
++		fVrrAllowed = false; fPipeBAllowed = false;
++		gVrrModes = 0; gHidpi = 0; gDpms = 0;
++	}
++	if (!adoptFirmwareMode(ap->getPhysicalAddress(), ap->getLength())) {
++		OSSafeReleaseNULL(fMMIO); OSSafeReleaseNULL(fIntelXe); fRegs = nullptr;
++		return false;
++	}
++	if (IODeviceMemory *sm = IODeviceMemory::withRange(fSurfPhys, (IOPhysicalLength)fRowBytes * fHeight)) {
++		fSurfMap = sm->map(kIOMapWriteCombineCache); sm->release();
++	}
++	if (!fSurfMap) {
++		FBLOG("surface at phys 0x%llx (%ux%u) failed write-combined BAR2 mapping: aborting to keep UEFI GOP console",
++		      (unsigned long long)fSurfPhys, fWidth, fHeight);
++		OSSafeReleaseNULL(fMMIO); OSSafeReleaseNULL(fIntelXe); fRegs = nullptr;
++		return false;
++	}
++	if (fDisplayVer < 14) {
++		const uint32_t dc = rd(DC_STATE_EN);
++		if (dc) {
++			FBLOG("DG2: clearing DC_STATE_EN 0x%08x -> 0 (DMC deferred, static power wells)", dc);
++			wr(DC_STATE_EN, 0);
++		}
++		FBLOG("DG2: display %u GOP adopted (pipe %c, PWR_WELL_CTL1 0x%08x CTL2 0x%08x AUX2 0x%08x)",
++		      fDisplayVer, 'A' + fPipe, rd(HSW_PWR_WELL_CTL1), rd(HSW_PWR_WELL_CTL2), rd(ICL_PWR_WELL_CTL_AUX2));
++	}
+ 	guardBegin();   // before anything that could take the machine down; published before the framebuffer is
+ 	probeEdid();
+ 	parseEdid();
+@@ -3665,12 +3819,12 @@ bool IntelXeFramebuffer::start(IOService *provider)
+ 		};
+ 		long v = 0;
+ 		if (nvNum("intelxefb-hwcursor", 0, 1, &v)) gHwCursor = (int)v;
+-		if (nvNum("intelxefb-dpms", 0, 1, &v)) gDpms = (int)v;
++		if (fDisplayVer >= 14 && nvNum("intelxefb-dpms", 0, 1, &v)) gDpms = (int)v;
+ 		if (nvNum("intelxefb-vrr-lfc", 0, 1, &v)) gVrrLfc = (int)v;
+ 		if (nvNum("intelxefb-vrr-floor", 0, 500, &v)) gVrrFloorHz = (uint32_t)v;
+ 	}
+ 	cursorInit();
+-	{
++	if (fDisplayVer >= 14) {
+ 		// macOS Adaptive-Sync modes, on unless boot-arg intelxefb_vrrmodes=0 or NVRAM intelxefb-vrr-modes=0 (the EDID change needs it at start)
+ 		int v = 0;
+ 		if (intelxeBootArg("IntelXeFB", "intelxefb_vrrmodes", &v, sizeof v)) gVrrModes = v;
+@@ -3701,7 +3855,8 @@ bool IntelXeFramebuffer::start(IOService *provider)
+ 	if (!IOFramebuffer::start(provider)) {
+ 		guardAbandon(); fGuardStage = 0;
+ 		if (fGuardCall) { thread_call_cancel(fGuardCall); while (!thread_call_free(fGuardCall)) { thread_call_cancel(fGuardCall); IOSleep(5); } fGuardCall = nullptr; }
+-		OSSafeReleaseNULL(fMMIO); fRegs = nullptr;
++		OSSafeReleaseNULL(fSurfMap); OSSafeReleaseNULL(fMMIO); fRegs = nullptr;
++		ggttRelease(); OSSafeReleaseNULL(fIntelXe);
+ 		if (fDispLock) { IOLockFree(fDispLock); fDispLock = nullptr; }
+ 		if (fFlipLock) { IOSimpleLockFree(fFlipLock); fFlipLock = nullptr; }
+ 		if (fHpdImrLock) { IOSimpleLockFree(fHpdImrLock); fHpdImrLock = nullptr; }
+@@ -3729,10 +3884,6 @@ bool IntelXeFramebuffer::start(IOService *provider)
+ 	setProperty("IntelXeFBVram", fDpa, 64);
+ 	setProperty("IntelXeFBScanoutVersion", 4ull, 32);   // NMXScanout 2 (adaptive-sync window), 3 (DPA runs), 4 (vblank phase)
+ 	publishFlipWait();
+-	if (IODeviceMemory *sm = IODeviceMemory::withRange(fSurfPhys, (IOPhysicalLength)fRowBytes * fHeight)) {
+-		fSurfMap = sm->map(kIOMapWriteCombineCache); sm->release();
+-	}
+-	if (!fSurfMap) FBLOG("the surface would not map write-combined: no accelerated frames for this display");
+ 	armVbl();
+ 	fHpdCall = thread_call_allocate(hpdFire, this);                    // before the hotplug interrupt is unmasked
+ 	fHpdReenableCall = thread_call_allocate(hpdReenableFire, this);
+@@ -3810,8 +3961,8 @@ void IntelXeFramebuffer::stop(IOService *provider)
+ 	// no hotplug interrupt reaches hpdIrq after irqRegister(false) (IntelXe.kext: none in flight once unregistered)
+ 	if (fHpdCall) { thread_call_cancel(fHpdCall); while (!thread_call_free(fHpdCall)) { thread_call_cancel(fHpdCall); IOSleep(5); } fHpdCall = nullptr; }
+ 	if (fHpdReenableCall) { thread_call_cancel(fHpdReenableCall); while (!thread_call_free(fHpdReenableCall)) { thread_call_cancel(fHpdReenableCall); IOSleep(5); } fHpdReenableCall = nullptr; }
+-	if (fRegs && fShpdFilterBoot != ~0u) wr(SHPD_FILTER_CNT, fShpdFilterBoot);   // the firmware's debounce back
+-	if (fRegs && fPipe >= 0) { dispLock(); vrrDisableLocked("stop"); programPixelClock(fPclk); dispUnlock(); }   // fixed refresh at the firmware's clock
++	if (fDisplayVer >= 14 && fRegs && fShpdFilterBoot != ~0u) wr(SHPD_FILTER_CNT, fShpdFilterBoot);   // the firmware's debounce back
++	if (fDisplayVer >= 14 && fRegs && fPipe >= 0) { dispLock(); vrrDisableLocked("stop"); programPixelClock(fPclk); dispUnlock(); }   // fixed refresh at the firmware's clock
+ 	if (fCurReady) {   // cursor plane off (and its DDB/watermark back to the firmware's zero), then its GGTT window goes
+ 		cursorPark(true);
+ 		wr(CUR_WM(fPipe, 0), 0); wr(CUR_BUF_CFG(fPipe), 0); wr(CURBASE(fPipe), kCurGgtt);
+@@ -3884,7 +4035,7 @@ int IntelXeFramebuffer::auxXfer(uint32_t ctl, const uint8_t *tx, uint32_t txn, u
+ {
+ 	if (txn > 20 || rxmax > 20) return -1;
+ 	uint32_t send = AUX_SEND_BUSY | AUX_DONE | AUX_TIME_OUT_ERROR | AUX_TIME_OUT_MAX | AUX_RECEIVE_ERROR |
+-	                (txn << 20) | AUX_SYNC | AUX_POWER_REQUEST;
++	                (txn << 20) | AUX_SYNC | (fDisplayVer >= 14 ? AUX_POWER_REQUEST : 0u);
+ 	uint32_t status = 0;
+ 	for (int t = 0; t < 5; t++) {
+ 		for (uint32_t i = 0; i < txn; i += 4) {
+@@ -4005,7 +4156,41 @@ bool IntelXeFramebuffer::readEdidInto(uint32_t ctl, uint8_t *edid, uint32_t *edi
+ // put back as it was. Without an EDID the display is published unnamed with the one adopted mode.
+ void IntelXeFramebuffer::probeEdid()
+ {
+-	uint32_t port = (rd(TRANS_DDI_FUNC_CTL(fPipe)) >> 27) & 0xF;   // 1 + enum port (A 0, B 1, TC1 3 ...)
++	uint32_t port = (rd(TRANS_DDI_FUNC_CTL(fPipe)) >> 27) & 0xF;   // 1 + enum port (A 0, B 1, C 2, TC1 3, D_XELPD 7)
++	if (fDisplayVer < 14) {
++		// DG2 Display 13: TRANS_DDI_FUNC_CTL 30:27 -> A(1), B(2), C(3), USBC1/TC1(4), D(8)
++		int first = port == 1 ? 0 : port == 2 ? 1 : port == 3 ? 2 : port == 4 ? 3 : port == 8 ? 4 : -1;
++		fHpdPin = 0;
++		for (int k = -1; k < 5; k++) {
++			int a = k < 0 ? first : k;
++			if (a < 0 || (k >= 0 && a == first)) continue;
++			const uint32_t ctl = kAuxCtlDg2[a];
++			const int pwIdx = kAuxPwIdxDg2[a];
++			const uint32_t pwReq = intelxeplan::pwReq(pwIdx), pwState = intelxeplan::pwState(pwIdx);
++			bool auxReq = false;
++			if (!((rd(ICL_PWR_WELL_CTL_AUX1) | rd(ICL_PWR_WELL_CTL_AUX2)) & pwState)) {
++				wr(ICL_PWR_WELL_CTL_AUX2, rd(ICL_PWR_WELL_CTL_AUX2) | pwReq);
++				for (int t = 0; t < 40 && !(rd(ICL_PWR_WELL_CTL_AUX2) & pwState); t++) IODelay(50);
++				auxReq = true;
++			}
++			bool ok = readEdid(ctl);
++			if (auxReq) wr(ICL_PWR_WELL_CTL_AUX2, rd(ICL_PWR_WELL_CTL_AUX2) & ~pwReq);
++			if (ok) {
++				char name[14] = "";
++				for (int d = 54; d <= 108; d += 18)   // the monitor-name descriptor (tag 0xFC)
++					if (!fEdid[d] && !fEdid[d + 1] && fEdid[d + 3] == 0xFC) {
++						for (int i = 0; i < 13 && fEdid[d + 5 + i] != 0x0A; i++) name[i] = (char)fEdid[d + 5 + i];
++						break;
++					}
++				FBLOG("edid: %u bytes on DG2 AUX %s (0x%x, DDI port select %u), monitor \"%s\"", fEdidLen, kAuxNameDg2[a], ctl, port, name);
++				setProperty("IntelXeFBEdidAux", kAuxNameDg2[a]);
++				fAux = ctl;
++				return;
++			}
++		}
++		FBLOG("edid: no reply on any DG2 AUX channel (DDI port select %u); using GOP mode", port);
++		return;
++	}
+ 	int first = port == 1 ? 0 : port == 2 ? 1 : (port >= 4 && port <= 7) ? (int)port - 2 : -1;
+ 	// the panel's HPD pin (encoder->hpd_pin, hpd_mtp): DDI A/B -> SDE 16/17, TC1-4 -> SDE 24-27
+ 	fHpdPin = port == 1 ? 1u << 16 : port == 2 ? 1u << 17 : (port >= 4 && port <= 7) ? 1u << (24 + port - 4) : 0;
+@@ -4062,9 +4247,10 @@ void IntelXeFramebuffer::buildModes()
+ 	pn.width = fWidth; pn.height = fHeight; pn.htotal = fHT; pn.vtotal = fVT; pn.pclkHz = fPclk;
+ 	pn.hsyncStart = fHSS; pn.hsyncEnd = fHSE; pn.vsyncStart = fVSS; pn.vsyncEnd = fVSE;
+ 	pn.vrr = fVrrCapable && fVrrAllowed; pn.vrrMin = (int)fVrrMinHz; pn.vrrMax = (int)fVrrMaxHz;
++	if (fDisplayVer < 14) { fScaling = false; fRates = false; fCommonRates = false; }
+ 	pn.scaling = fScaling; pn.rates = fRates; pn.commonRates = fCommonRates; pn.maxVtotal = 8192;
+ 	pn.edid = fEdidParse;
+-	if (fEdidParse && fEdidParse->count) {
++	if (fDisplayVer >= 14 && fEdidParse && fEdidParse->count) {
+ 		const uint32_t ddi = fPipe >= 0 ? rd(TRANS_DDI_FUNC_CTL(fPipe)) : 0, sel = (ddi >> 27) & 0xF, w = (ddi >> 1) & 7;
+ 		intelxeedid::Sink sk = {};
+ 		sk.maxDotclk = 1305600;   // intel_cdclk.c:3401: 2 pixels/clock x 652800 kHz (display 11+, 38.4 MHz ref)
+@@ -4074,7 +4260,7 @@ void IntelXeFramebuffer::buildModes()
+ 			uint8_t bw = 0;
+ 			sk.linkRate = dpcd(0x100, &bw, 1, false) == 0 && bw ? bw * 27000 : 810000;
+ 		}
+-		sk.bpp = 24; sk.interlace = false; sk.ycbcr420 = false; sk.displayVer = 14;
++		sk.bpp = 24; sk.interlace = false; sk.ycbcr420 = false; sk.displayVer = fDisplayVer;
+ 		intelxeedid::Mode *valid = (intelxeedid::Mode *)IOMallocZero(sizeof(intelxeedid::Mode) * intelxeedid::kMaxModes);
+ 		if (valid) {
+ 			int nv = 0;
+@@ -4482,6 +4668,7 @@ void IntelXeFramebuffer::planLive(intelxeplan::LiveState *s, int pipeB) const
+ 	const int p = fPipe;
+ 	*s = {};
+ 	s->pipeA = p;
++	if (fDisplayVer < 14 || p < 0 || !fRegs) return;
+ 	s->htotal = rd(TR_(p, 0x60000)); s->hblank = rd(TR_(p, 0x60004)); s->hsync = rd(TR_(p, 0x60008));
+ 	s->vtotal = rd(TR_(p, 0x6000C)); s->vblank = rd(TR_(p, 0x60010)); s->vsync = rd(TR_(p, 0x60014));
+ 	s->scl = rd(TRANS_SET_CONTEXT_LATENCY(p)); s->pipesrc = rd(TR_(p, 0x6001C)); s->funcCtl = rd(TRANS_DDI_FUNC_CTL(p));
+@@ -4558,7 +4745,7 @@ bool IntelXeFramebuffer::connMode(Conn &c, intelxeedid::Result *res)
+ void IntelXeFramebuffer::connScan()
+ {
+ 	using namespace intelxeplan;
+-	if (!fRegs || fPipe < 0) return;
++	if (fDisplayVer < 14 || !fRegs || fPipe < 0) return;
+ 	const uint32_t live = rd(SDEISR);
+ 	const uint32_t sel = (rd(TRANS_DDI_FUNC_CTL(fPipe)) >> 27) & 0xF;
+ 	intelxeedid::Result *res = (intelxeedid::Result *)IOMallocZero(sizeof(intelxeedid::Result));
+@@ -4661,6 +4848,7 @@ void IntelXeFramebuffer::pipeBSurfaceFree()
+ bool IntelXeFramebuffer::pmdemandProgram(uint32_t r0, uint32_t r1, const char *why)
+ {
+ 	using namespace intelxeplan;
++	if (fDisplayVer < 14 || !fRegs) return false;
+ 	auto clear = [this](uint32_t off, uint32_t bit) { for (int t = 0; t < 200; t++) { if (!(rd(off) & bit)) return true; IODelay(50); } return false; };
+ 	if (!clear(PMDEMAND1, PMDEMAND_REQ) || !clear(DCPR_STATUS_1, PMDEMAND_INFLIGHT)) { FBLOG("pmdemand (%s): a request is still in flight", why); return false; }
+ 	const uint32_t c0 = rd(PMDEMAND0), c1 = rd(PMDEMAND1);
+@@ -4739,6 +4927,7 @@ void IntelXeFramebuffer::pipeBGlobalsBack(int pipeB)
+ int IntelXeFramebuffer::pipeBOn(const char *why)
+ {
+ 	using namespace intelxeplan;
++	if (fDisplayVer < 14) return ENOTSUP;
+ 	if (!fPipeBAllowed) return EPERM;
+ 	if (!fRegs || fPipe < 0 || fStopping) return ENODEV;
+ 	if (fPipeB >= 0) return 0;
+@@ -4837,7 +5026,7 @@ int IntelXeFramebuffer::pipeBOn(const char *why)
+ int IntelXeFramebuffer::pipeBOff(const char *why, bool tellFb)
+ {
+ 	using namespace intelxeplan;
+-	if (fPipeB < 0) return 0;
++	if (fDisplayVer < 14 || fPipeB < 0) return 0;
+ 	const int pb = fPipeB;
+ 	if (fSecond && tellFb) fSecond->setConnected(false);
+ 	dispLock();
+@@ -4927,7 +5116,7 @@ void IntelXeFramebuffer::pipeBBlank(bool off)
+ // for a new one
+ void IntelXeFramebuffer::pipeBWork()
+ {
+-	if (fStopping || !fPipeBAllowed || fPipe < 0 || fSysSuspended || !fPipeBLock) return;
++	if (fDisplayVer < 14 || fStopping || !fPipeBAllowed || fPipe < 0 || fSysSuspended || !fPipeBLock) return;
+ 	IOSleep(500);   // a sink's AUX after its hotplug pulse (replugFire waits as long)
+ 	if (fStopping) return;
+ 	IOLockLock(fPipeBLock);
+@@ -4949,6 +5138,7 @@ void IntelXeFramebuffer::pipeBWork()
+ // debug.intelxefb_pipeb: 1 scan + light, 0 off, 2 scan only
+ int IntelXeFramebuffer::pipeBCommand(int v)
+ {
++	if (fDisplayVer < 14) return ENOTSUP;
+ 	if (!fPipeBAllowed || !fPipeBLock) return EPERM;
+ 	IOLockLock(fPipeBLock);
+ 	int r = 0;
+@@ -4970,6 +5160,7 @@ int IntelXeFramebuffer::pipeBPlanText(char *b, int n)
+ 	Txt t = { b, n, 0 };
+ 	b[0] = 0;
+ 	if (!fRegs || fPipe < 0) { t.p("no pipe adopted\n"); return t.len; }
++	if (fDisplayVer < 14) { t.p("second-pipe plan: Display 14+ only (current display %u)\n", fDisplayVer); return t.len; }
+ 	LiveState *s = (LiveState *)IOMallocZero(sizeof(LiveState));
+ 	Plan *pl = (Plan *)IOMallocZero(sizeof(Plan));
+ 	if (!s || !pl) { if (s) IOFree(s, sizeof *s); if (pl) IOFree(pl, sizeof *pl); t.p("no memory\n"); return t.len; }

@@ -1,0 +1,1871 @@
+diff --git a/kernel/IntelXe/IntelXe.cpp b/kernel/IntelXe/IntelXe.cpp
+index 7936076..4f34670 100644
+--- a/kernel/IntelXe/IntelXe.cpp
++++ b/kernel/IntelXe/IntelXe.cpp
+@@ -434,7 +434,19 @@ void IntelXe::sensorsSampleLocked(XeSensorsSample *x)
+ 		return;
+ 	}
+ 	xeSensorsBegin(*x, INTELXE_SENSORS_OK, ns);
+-	xeSensorsSetRegs(*x, rd(0xc60), rd(0xa008), rd(0x138000), rd(BMG_PACKAGE_TEMPERATURE), rd(BMG_VRAM_TEMPERATURE));
++	const bool isBmg = gXePlat && gXePlat->platform == XE_BATTLEMAGE;
++	const bool ver1270 = !gXePlat || gXePlat->graphicsVerx100 >= 1270;
++	uint32_t wp1 = 0, cap = 0;
++	if (ver1270) {
++		wp1 = rd(0xc60);
++		cap = rd(0x138000);
++	} else {
++		const uint32_t ps = rd(GT_PERF_STATUS), snb = rd(RP_STATE_CAP_SNB);
++		wp1 = ps == 0xffffffffu ? ps : ((ps >> 11) & 0x1ff);
++		cap = snb == 0xffffffffu ? snb : ((((snb & 0xff) * 3) & 0x1ff) | ((((snb >> 16) & 0xff) * 3) & 0x1ff) << 16);
++	}
++	xeSensorsSetRegs(*x, wp1, rd(0xa008), cap, isBmg ? rd(BMG_PACKAGE_TEMPERATURE) : 0,
++		isBmg ? rd(BMG_VRAM_TEMPERATURE) : 0);
+ 	if (x->s.state != INTELXE_SENSORS_OK) return;
+ 	engActSample(&x->s);
+ 	uint32_t rpe = 0, min = 0, max = 0;
+@@ -922,7 +934,6 @@ bool IntelXe::start(IOService *provider) {
+ 		nvInt("intelxe-gpu-profile", 0, 1, &gSlpcProfile);
+ 		nvInt("intelxe-gpu-min-mhz", 0, 3000, &gSlpcMin);
+ 		nvInt("intelxe-gpu-max-mhz", 0, 3000, &gSlpcMax);
+-		if (gSlpcMin == 0) gSlpcMin = 1200;   // 0 in NVRAM: the default floor (BMG_MIN_FREQ, every BMG primary GT)
+ 	}
+ 	int wf = 0;   // rb7q: debug.intelxe.surfvram_wsfull at boot (default 1)
+ 	if (intelxeBootArg("IntelXe", "intelxe_svwsfull", &wf, sizeof(wf))) gSurfVramWsFull = wf;
+@@ -953,13 +964,17 @@ bool IntelXe::start(IOService *provider) {
+ 		LOG("!!!!!!!! untested hardware: a hang or a panic is possible; remove %s to go back. What is known: %s", testerArg,
+ 			plat->missing);
+ 	}
+-	if (!fwIs(plat->gucFw, kGucFwName) || !fwIs(plat->hucFw, kHucFwName)) {
+-		LOG("8086:%04x (%s): built-in firmware %s, %s; the platform needs %s, %s", id, plat->name, kGucFwName, kHucFwName,
+-			plat->gucFw ? plat->gucFw : "none", plat->hucFw ? plat->hucFw : "none");
++	const bool hucOk = plat->hucFw ? fwIs(plat->hucFw, kHucFwName) : (kHucFwSize == 0);
++	if (!fwIs(plat->gucFw, kGucFwName) || !hucOk) {
++		LOG("8086:%04x (%s): built-in firmware %s, %s; the platform needs %s, %s", id, plat->name, kGucFwName,
++			*kHucFwName ? kHucFwName : "none", plat->gucFw ? plat->gucFw : "none", plat->hucFw ? plat->hucFw : "none");
+ 		return false;
+ 	}
+ 	gXePlat = plat;
+ 	gXePlatId = id;
++	if (gSlpcMin == 0 && xePlatformSlpcMinPrimary(plat)) gSlpcMin = 1200;   // BMG_MIN_FREQ (BMG / Wa_14022085890 only)
++	if (!plat->hasUsm) gUsm = 0;
++	if (plat->maxGtPerTile < 2) gVideoWanted = 0;
+ 	{
+ 		// The same line as a registry property ("IntelXePlatform"): the log of a boot does not keep a message this early
+ 		// (the kext starts from the boot kernel collection before logd runs, and the kernel message buffer wraps), so the
+@@ -1057,6 +1072,10 @@ bool IntelXe::start(IOService *provider) {
+ 		{0xe211, "Intel Arc Pro B60 Graphics"},
+ 		{0xe212, "Intel Arc Pro B50 Graphics"},
+ 		{0xe223, "Intel Arc Pro B70 Graphics"},
++		{0x56a0, "Intel Arc A770 Graphics"},
++		{0x56a1, "Intel Arc A750 Graphics"},
++		{0x56a5, "Intel Arc A580 Graphics"},
++		{0x56a6, "Intel Arc A380 Graphics"},
+ 	};
+ 	const char *model = "Intel Arc Graphics";   // an id without a product name (Linux and Mesa name none for it)
+ 	for (const auto &m : kModels)
+@@ -1271,24 +1290,34 @@ int IntelXe::runStep(int step) {
+ 			break;
+ 		case 11:   // pc_set_cur_freq: request gFreqMhz with manual RP control, as xe_guc_pc_raise_unslice does
+ 			if ((err = mapBar0() ? 0 : ENXIO) == 0 && forcewake(true)) {
++				const bool ver1270 = !gXePlat || gXePlat->graphicsVerx100 >= 1270;
+ 				wr(0xa024, 2u << 9);                                   // RP_CONTROL: RPSWCTL_ENABLE
+ 				wr(0xa008, ((gFreqMhz * 3 + 25) / 50) << 23);          // RPNSWREQ ratio in 16.67 MHz units
+ 				IODelay(300);
+-				uint32_t a = rd(0xc60) & 0x1ff;
++				uint32_t a = (ver1270 ? rd(0xc60) : (rd(GT_PERF_STATUS) >> 11)) & 0x1ff;
+ 				if (!gFreqKeepManual) wr(0xa024, 0);
+ 				IODelay(1000);
++				uint32_t b = (ver1270 ? rd(0xc60) : (rd(GT_PERF_STATUS) >> 11)) & 0x1ff;
+ 				say("requested %u MHz: act %u MHz right after, %u MHz 1 ms later (manual control %s)\n", gFreqMhz,
+-					(a * 50 + 1) / 3, ((rd(0xc60) & 0x1ff) * 50 + 1) / 3, gFreqKeepManual ? "kept" : "released");
++					(a * 50 + 1) / 3, (b * 50 + 1) / 3, gFreqKeepManual ? "kept" : "released");
+ 				forcewake(false);
+ 			}
+ 			break;
+-		case 10:   // GT frequency (xe_guc_pc.c): CAGF in MTL_MIRROR_TARGET_WP1, request in RPNSWREQ, caps in MTL_RP_STATE_CAP
++		case 10:   // GT frequency (xe_guc_pc.c): CAGF, request in RPNSWREQ, caps in MTL_RP_STATE_CAP / SNB RP_STATE_CAP
+ 			if ((err = mapBar0() ? 0 : ENXIO) == 0 && forcewake(true)) {
+ 				auto mhz = [](uint32_t raw) { return (raw * 50 + 1) / 3; };
+-				uint32_t cap = rd(0x138000);
+-				say("act %u MHz, requested %u MHz, RP0 %u MHz, RPn %u MHz, RPe %u MHz, RPa %u MHz\n", mhz(rd(0xc60) & 0x1ff),
+-					mhz(rd(0xa008) >> 23 & 0x1ff), mhz(cap & 0x1ff), mhz(cap >> 16 & 0x1ff), mhz(rd(0x13800c) & 0x1ff),
+-					mhz(rd(0x138008) & 0x1ff));
++				if (!gXePlat || gXePlat->graphicsVerx100 >= 1270) {
++					uint32_t cap = rd(0x138000);
++					say("act %u MHz, requested %u MHz, RP0 %u MHz, RPn %u MHz, RPe %u MHz, RPa %u MHz\n", mhz(rd(0xc60) & 0x1ff),
++						mhz(rd(0xa008) >> 23 & 0x1ff), mhz(cap & 0x1ff), mhz(cap >> 16 & 0x1ff), mhz(rd(0x13800c) & 0x1ff),
++						mhz(rd(0x138008) & 0x1ff));
++				} else {
++					uint32_t cap = rd(RP_STATE_CAP_SNB), rec = rd(FREQ_INFO_REC);
++					say("act %u MHz, requested %u MHz, RP0 %u MHz, RPn %u MHz, RPe %u MHz, RPa %u MHz\n",
++						mhz((rd(GT_PERF_STATUS) >> 11) & 0x1ff), mhz(rd(0xa008) >> 23 & 0x1ff),
++						(cap & 0xff) * 50u, ((cap >> 16) & 0xff) * 50u,
++						((rec >> 8) & 0xff) * 50u, ((rec >> 16) & 0xffff) * 50u);
++				}
+ 				say("interrupts %s, %u handled\n", irqOn ? "on" : "off", irqCount);
+ 				forcewake(false);
+ 			}
+@@ -1410,24 +1439,33 @@ int IntelXe::probe() {
+ 		pci->configRead16(kIOPCIConfigCommand), pm ? pci->configRead16(pm + 4) : 0xffff);
+ 	if (!mapBar0()) return ENXIO;
+ 
+-	uint32_t g = rd(GMD_ID), m = rd(MEDIA_GT_GSI_OFFSET + GMD_ID);
+-	say("graphics IP %u.%02u rev %u (GMD_ID 0x%08x), media IP %u.%02u rev %u (0x%08x)\n", g >> 22, (g >> 14) & 0xff,
+-		g & 0x3f, g, m >> 22, (m >> 14) & 0xff, m & 0x3f, m);
++	if (gXePlat && gXePlat->preGmdidGraphics) {
++		say("graphics IP %u.%02u (pre-GMD_ID), media IP %u.%02u (pre-GMD_ID)\n",
++			gXePlat->graphicsVerx100 / 100, gXePlat->graphicsVerx100 % 100,
++			gXePlat->mediaVerx100 / 100, gXePlat->mediaVerx100 % 100);
++	} else {
++		uint32_t g = rd(GMD_ID);
++		uint32_t m = (!gXePlat || gXePlat->maxGtPerTile >= 2) ? rd(MEDIA_GT_GSI_OFFSET + GMD_ID) : 0;
++		say("graphics IP %u.%02u rev %u (GMD_ID 0x%08x), media IP %u.%02u rev %u (0x%08x)\n", g >> 22, (g >> 14) & 0xff,
++			g & 0x3f, g, m >> 22, (m >> 14) & 0xff, m & 0x3f, m);
++	}
+ 	uint32_t gu = rd(GU_CNTL), s0 = rd(PCODE_SCRATCH0);
+ 	say("GU_CNTL 0x%08x (LMEM_INIT %u), GU_DEBUG 0x%08x, tiles %u\n", gu, (gu >> 7) & 1, rd(GU_DEBUG),
+ 		(rd(XEHP_MTCFG_ADDR) >> 8) & 0xff);
+ 	say("PCODE_SCRATCH0 0x%08x (boot status %u%s), mailbox 0x%08x, PCIE_CAP 0x%08x\n", s0, (s0 >> 1) & 7,
+ 		((s0 >> 1) & 7) == 4 ? " CRITICAL" : ((s0 >> 1) & 7) == 7 ? " NON-CRITICAL" : "", rd(PCODE_MAILBOX),
+-		rd(BMG_PCIE_CAP));
++		(gXePlat && gXePlat->platform == XE_BATTLEMAGE) ? rd(BMG_PCIE_CAP) : 0);
+ 	uint32_t r = rd(SG_TILE_ADDR_RANGE0);
+ 	say("SG_TILE_ADDR_RANGE0 0x%08x (%u GB at %u GB), GSMBASE 0x%08x%08x, DSMBASE 0x%08x%08x, STOLEN_RESERVED 0x%08x\n",
+ 		r, (r >> 8) & 0x3ff, (r >> 1) & 0x7f, rd(GSMBASE + 4), rd(GSMBASE), rd(DSMBASE + 4), rd(DSMBASE), rd(STOLEN_RESERVED));
+-	say("forcewake ack GT 0x%08x render 0x%08x\n", rd(FORCEWAKE_ACK_GT), rd(FORCEWAKE_ACK_RENDER));
++	const uint32_t ackGtReg = (!gXePlat || gXePlat->graphicsVerx100 >= 1270) ? FORCEWAKE_ACK_GT_MTL : FORCEWAKE_ACK_GT;
++	say("forcewake ack GT 0x%08x render 0x%08x\n", rd(ackGtReg), rd(FORCEWAKE_ACK_RENDER));
+ 	say("GuC status 0x%08x, WOPCM size 0x%08x offset 0x%08x\n", rd(GUC_STATUS), rd(GUC_WOPCM_SIZE), rd(DMA_GUC_WOPCM_OFFSET));
+ 	say("fuses: geometry DSS 0x%08x compute DSS 0x%08x vebox/vdbox disable 0x%08x\n", rd(XELP_GT_GEOMETRY_DSS_ENABLE),
+ 		rd(XEHP_GT_COMPUTE_DSS_ENABLE), rd(GT_VEBOX_VDBOX_DISABLE));
+-	say("package temp 0x%08x, VRAM temp 0x%08x, fan1 0x%08x\n", rd(BMG_PACKAGE_TEMPERATURE), rd(BMG_VRAM_TEMPERATURE),
+-		rd(BMG_FAN_1_SPEED));
++	if (!gXePlat || gXePlat->platform == XE_BATTLEMAGE)
++		say("package temp 0x%08x, VRAM temp 0x%08x, fan1 0x%08x\n", rd(BMG_PACKAGE_TEMPERATURE),
++			rd(BMG_VRAM_TEMPERATURE), rd(BMG_FAN_1_SPEED));
+ 	return 0;
+ }
+ 
+@@ -1538,6 +1576,7 @@ bool IntelXe::waitFor(uint32_t off, uint32_t mask, uint32_t val, uint32_t us, ui
+ // that gets no ack takes no reference.
+ bool IntelXe::forcewake(bool on, uint32_t gt) {
+ 	const uint32_t g = gt ? 1 : 0;
++	const uint32_t ackGtReg = (!gXePlat || gXePlat->graphicsVerx100 >= 1270) ? FORCEWAKE_ACK_GT_MTL : FORCEWAKE_ACK_GT;
+ 	uint32_t ack = 0;
+ 	bool ok = true;
+ 	const char *dom = "GT";
+@@ -1545,7 +1584,7 @@ bool IntelXe::forcewake(bool on, uint32_t gt) {
+ 	if (on) {
+ 		if (!fwCount[g]) {
+ 			wr(gt + FORCEWAKE_GT, 0x10001);
+-			ok = waitFor(gt + FORCEWAKE_ACK_GT_MTL, 1, 1, 50000, &ack) && ack != ~0u;
++			ok = waitFor(gt + ackGtReg, 1, 1, 50000, &ack) && ack != ~0u;
+ 			if (ok && !gt) {
+ 				dom = "render";
+ 				wr(FORCEWAKE_RENDER, 0x10001);
+@@ -1561,7 +1600,7 @@ bool IntelXe::forcewake(bool on, uint32_t gt) {
+ 			if (!waitFor(FORCEWAKE_ACK_RENDER, 1, 0, 50000, &ack)) { ok = false; dom = "render"; }
+ 		}
+ 		wr(gt + FORCEWAKE_GT, 0x10000);
+-		if (!waitFor(gt + FORCEWAKE_ACK_GT_MTL, 1, 0, 50000, &ack)) ok = false;
++		if (!waitFor(gt + ackGtReg, 1, 0, 50000, &ack)) ok = false;
+ 	}
+ 	IOLockUnlock(gFwLock);
+ 	if (!ok) say("%sforcewake %s (%s): no ack (0x%08x)\n", gt ? "media " : "", on ? "on" : "off", dom, ack);
+@@ -1589,13 +1628,17 @@ static uint32_t patReg(int i) { return i < 8 ? 0x4800 + i * 4 : 0x4848 + (i - 8)
+ int IntelXe::readGt() {
+ 	if (!mapBar0()) return ENXIO;
+ 	if (!forcewake(true)) return ETIMEDOUT;
++	const bool ver20 = !gXePlat || gXePlat->graphicsVerx100 >= 2000;
+ 	say("fuses: geometry DSS 0x%08x 0x%08x 0x%08x, compute DSS 0x%08x 0x%08x 0x%08x, EU 0x%08x, vebox/vdbox off 0x%08x\n",
+-		rd(XELP_GT_GEOMETRY_DSS_ENABLE), rd(XE2_GT_GEOMETRY_DSS_1), rd(XE2_GT_GEOMETRY_DSS_2), rd(XEHP_GT_COMPUTE_DSS_ENABLE),
+-		rd(XEHPC_GT_COMPUTE_DSS_ENABLE_EXT), rd(XE2_GT_COMPUTE_DSS_2), rd(XELP_EU_ENABLE), rd(GT_VEBOX_VDBOX_DISABLE));
++		rd(XELP_GT_GEOMETRY_DSS_ENABLE), ver20 ? rd(XE2_GT_GEOMETRY_DSS_1) : 0, ver20 ? rd(XE2_GT_GEOMETRY_DSS_2) : 0,
++		rd(XEHP_GT_COMPUTE_DSS_ENABLE), rd(XEHPC_GT_COMPUTE_DSS_ENABLE_EXT), ver20 ? rd(XE2_GT_COMPUTE_DSS_2) : 0,
++		rd(XELP_EU_ENABLE), rd(GT_VEBOX_VDBOX_DISABLE));
+ 	say("PAT:");
+-	for (int i = 0; i < 32; i++) say(" %x", rd(patReg(i)));
+-	say("\nPAT_ATS 0x%x PAT_PTA 0x%x\nMOCS:", rd(PAT_ATS), rd(PAT_PTA));
+-	for (int i = 0; i < 16; i++) say(" %x", rd(GLOBAL_MOCS0 + i * 4));
++	const int nPat = ver20 ? 32 : (gXePlat ? gXePlat->patEntries : 4);
++	for (int i = 0; i < nPat; i++) say(" %x", rd(patReg(i)));
++	if (ver20) say("\nPAT_ATS 0x%x PAT_PTA 0x%x\nMOCS:", rd(PAT_ATS), rd(PAT_PTA));
++	else say("\nLNCFCMOCS:");
++	for (int i = 0; i < (ver20 ? 16 : 4); i++) say(" %08x", rd((ver20 ? GLOBAL_MOCS0 : XEHP_LNCFCMOCS0) + i * 4));
+ 	say("\n");
+ 	gucStatus();
+ 	forcewake(false);
+@@ -1618,6 +1661,18 @@ void IntelXe::gucStatus(uint32_t gt) {
+ // The media GT takes the same tables as plain registers at +0x380000 (xe2_pat_ops program_media = program_pat with
+ // pat_media_pta = xe2_pat_pta on dGFX; regs_are_mcr false for media < 20, uc_index 3).
+ void IntelXe::programPatMocs(uint32_t gt) {
++	if (gXePlat && gXePlat->graphicsVerx100 < 2000) {
++		// xe_pat.c xelp_pat_table (DG2 uses xehp_pat_ops: MCR multicast write): [0]=WB(3), [1]=WC(1), [2]=WT(2), [3]=UC(0)
++		static const uint32_t xelpPat[4] = {3, 1, 2, 0};
++		for (int i = 0; i < 4; i++) wr(gt + patReg(i), xelpPat[i]);
++		// xe_mocs.c dg2_mocs_desc (HAS_LNCF_MOCS only, uc_index=1, unused_entries_index=3, XELP_NUM_MOCS_ENTRIES=64):
++		// 0: 0x90 (L3_1_UC|L3_LKUP), 1: 0xd0 (L3_1_UC|L3_GLBGO|L3_LKUP), 2: 0x50 (L3_1_UC|L3_GLBGO), 3+: 0xb0 (L3_3_WB|L3_LKUP)
++		for (int i = 0; i < 32; i++) {
++			const uint32_t v = i == 0 ? 0x00d00090u : i == 1 ? 0x00b00050u : 0x00b000b0u;
++			wr(gt + XEHP_LNCFCMOCS0 + i * 4, v);
++		}
++		return;
++	}
+ 	#define XE2_PAT(np, comp, clos, l3, l4, coh) ((np) << 10 | (comp) << 9 | (clos) << 6 | (l3) << 4 | (l4) << 2 | (coh))
+ 	static const uint32_t pat[28] = {
+ 		XE2_PAT(0, 0, 0, 0, 3, 0), XE2_PAT(0, 0, 0, 0, 3, 2), XE2_PAT(0, 0, 0, 0, 3, 3), XE2_PAT(0, 0, 0, 3, 3, 0),
+@@ -1699,7 +1754,8 @@ int IntelXe::ggttMap(IOBufferMemoryDescriptor *mem, uint32_t ggtt, uint32_t gt,
+ 			err = EFAULT;
+ 			break;
+ 		}
+-		gsm[(ggtt + off) >> 12] = pa | 1 | (1ull << 53);
++		const uint64_t pat = (!gXePlat || gXePlat->graphicsVerx100 >= 1270) ? (1ull << 53) : 0;
++		gsm[(ggtt + off) >> 12] = pa | 1 | pat;
+ 	}
+ 	if (err) {
+ 		rec.dma.unmap();
+@@ -1748,8 +1804,8 @@ int IntelXe::ggttMapVram(uint64_t dpa, uint32_t len, uint32_t ggtt, uint32_t gt,
+ 	rec.dpa = dpa;
+ 	rec.len = len;
+ 	rec.uc = uc;
+-	// PAT index 2 (WB), or 3 (XE_CACHE_NONE on Xe2, for XE_BO_FLAG_NEEDS_UC: the GuC's UM queues): bits 52 / 53
+-	const uint64_t pat = uc ? 3ull << 52 : 1ull << 53;
++	// PAT index 2 (WB), or 3 (XE_CACHE_NONE on Xe2, for XE_BO_FLAG_NEEDS_UC): bits 52/53 on >= 12.70; 0 on xelp/xehpg
++	const uint64_t pat = (!gXePlat || gXePlat->graphicsVerx100 >= 1270) ? (uc ? 3ull << 52 : 1ull << 53) : 0;
+ 	volatile uint64_t *gsm = reinterpret_cast<volatile uint64_t *>(bar0->getVirtualAddress() + 0x800000);
+ 	for (uint32_t off = 0; off < len; off += 4096) gsm[(ggtt + off) >> 12] = (dpa + off) | 1 | 2 | pat;
+ 	IOLockUnlock(gGgttLock);
+@@ -1768,8 +1824,12 @@ int IntelXe::ggttMapVram(uint64_t dpa, uint32_t len, uint32_t ggtt, uint32_t gt,
+ // window reused by the next queue on that slot, a scan-out range).
+ void IntelXe::ggttInvalidate(uint32_t gt) {
+ 	const bool fw = forcewake(true, gt);
+-	wr(gt + PVC_GUC_TLB_INV_DESC1, 1u << 6);
+-	wr(gt + PVC_GUC_TLB_INV_DESC0, 1u << 0);
++	if (gXePlat && gXePlat->graphicsVerx100 < 2000) {
++		wr(gt + GUC_TLB_INV_CR, 1u << 0);
++	} else {
++		wr(gt + PVC_GUC_TLB_INV_DESC1, 1u << 6);
++		wr(gt + PVC_GUC_TLB_INV_DESC0, 1u << 0);
++	}
+ 	if (fw) forcewake(false, gt);
+ }
+ 
+@@ -2034,9 +2094,11 @@ int IntelXe::gtReset() {
+ 	// rb7: the LRCs live in VRAM, written by the CPU through BAR2, which lands in the GPU's L2 (Wa_16023588340): write it
+ 	// back before the full reset, so no ring or context field the next registration needs can stay behind in it.
+ 	// Defensive (xe's do_gt_reset has no flush); a hung GPU makes it time out after 1 ms, which changes nothing.
+-	wr(0xb404, 1);   // XE2_GLOBAL_INVAL
+-	uint32_t gi = 0;
+-	waitFor(0xb404, 1, 0, 1000, &gi);
++	if (!gXePlat || gXePlat->graphicsVerx100 >= 2000) {
++		wr(0xb404, 1);   // XE2_GLOBAL_INVAL
++		uint32_t gi = 0;
++		waitFor(0xb404, 1, 0, 1000, &gi);
++	}
+ 	wr(0x941c, 1);   // GDRST: GRDOM_FULL
+ 	uint32_t g = 0;
+ 	const bool done = waitFor(0x941c, 1, 0, 5000000, &g);
+@@ -2052,8 +2114,10 @@ int IntelXe::gtReset() {
+ 	IOLockUnlock(gH2gLock[0]);
+ 	int err = firstBatchSetupOnly();   // engines, workarounds, GuC load, hwconfig, CT
+ 	if (!err && forcewake(true)) {
+-		wr(0x4194, rd(0x4194) | 1u << 6);   // Wa_16023588340 as bringUp applies it: XE2_GAMREQSTRM_CTRL CG_DIS_CNTLBUS
+-		wr(0xb194 + 3 * 8, 0xf);             //                                     XEHPC_L3CLOS_MASK(3)
++		if (!gXePlat || gXePlat->graphicsVerx100 >= 2000) {
++			wr(0x4194, rd(0x4194) | 1u << 6);   // Wa_16023588340 as bringUp applies it: XE2_GAMREQSTRM_CTRL CG_DIS_CNTLBUS
++			wr(0xb194 + 3 * 8, 0xf);             //                                     XEHPC_L3CLOS_MASK(3)
++		}
+ 		pcStart();
+ 		forcewake(false);
+ 	}
+@@ -2144,15 +2208,16 @@ void IntelXe::forcewakeRestore() {
+ 	IOLockLock(gFwLock);
+ 	uint32_t ack = 0;
+ 	bool ok = true;
++	const uint32_t ackGtReg = (!gXePlat || gXePlat->graphicsVerx100 >= 1270) ? FORCEWAKE_ACK_GT_MTL : FORCEWAKE_ACK_GT;
+ 	if (fwCount[0]) {
+ 		wr(FORCEWAKE_GT, 0x10001);
+-		ok = waitFor(FORCEWAKE_ACK_GT_MTL, 1, 1, 50000, &ack) && ok;
++		ok = waitFor(ackGtReg, 1, 1, 50000, &ack) && ok;
+ 		wr(FORCEWAKE_RENDER, 0x10001);
+ 		ok = waitFor(FORCEWAKE_ACK_RENDER, 1, 1, 50000, &ack) && ok;
+ 	}
+ 	if (fwCount[1]) {
+ 		wr(MEDIA_GT_GSI_OFFSET + FORCEWAKE_GT, 0x10001);
+-		ok = waitFor(MEDIA_GT_GSI_OFFSET + FORCEWAKE_ACK_GT_MTL, 1, 1, 50000, &ack) && ok;
++		ok = waitFor(MEDIA_GT_GSI_OFFSET + ackGtReg, 1, 1, 50000, &ack) && ok;
+ 	}
+ 	const uint32_t f0 = fwCount[0], f1 = fwCount[1];
+ 	IOLockUnlock(gFwLock);
+@@ -2209,8 +2274,10 @@ int IntelXe::gpuResume() {
+ 	IOLockUnlock(gH2gLock[0]);
+ 	if ((err = firstBatchSetupOnly())) return err;
+ 	if (forcewake(true)) {
+-		wr(0x4194, rd(0x4194) | 1u << 6);   // Wa_16023588340 (bringUp)
+-		wr(0xb194 + 3 * 8, 0xf);
++		if (!gXePlat || gXePlat->graphicsVerx100 >= 2000) {
++			wr(0x4194, rd(0x4194) | 1u << 6);   // Wa_16023588340 (bringUp)
++			wr(0xb194 + 3 * 8, 0xf);
++		}
+ 		pcStart();
+ 		forcewake(false);
+ 	}
+@@ -2321,6 +2388,7 @@ void IntelXe::adsRegsets(void *adsBlob, uint8_t *area, uint32_t areaG, uint32_t
+ 	};
+ 	if (!gt) {
+ 		bool firstRC = true;
++		const bool ver20 = !gXePlat || gXePlat->graphicsVerx100 >= 2000;
+ 		for (uint32_t k = 0; k < gNumEngines; k++) {
+ 			const XeEngine &e = gEngines[k];
+ 			const uint32_t b = e.base;
+@@ -2330,26 +2398,30 @@ void IntelXe::adsRegsets(void *adsBlob, uint8_t *area, uint32_t areaG, uint32_t
+ 			r[m++] = {b + 0xc4, kMasked};    // RING_CMD_CCTL
+ 			r[m++] = {b + 0x98, 0};          // RING_HWSTAM
+ 			r[m++] = {b + 0x29c, kMasked};   // GFX_MODE
+-			r[m++] = {b + 0xd4, kMasked};    // CSFE_CHICKEN1 (CS_PRIORITY_MEM_READ, Wa_16021639441)
+-			r[m++] = {b + 0x50, kMasked};    // RING_PSMI_CTL (Wa_16023105232)
++			if (ver20) {
++				r[m++] = {b + 0xd4, kMasked};    // CSFE_CHICKEN1 (CS_PRIORITY_MEM_READ, Wa_16021639441)
++				r[m++] = {b + 0x50, kMasked};    // RING_PSMI_CTL (Wa_16023105232)
++			}
+ 			r[m++] = {b + 0x80, 0};          // RING_HWS_PGA (extra_regs)
+ 			r[m++] = {b + 0xa8, 0};          // RING_IMR (extra_regs)
+-			r[m++] = {b + 0x23c, 0};         // RING_IDLEDLY (Wa_16023105232)
++			if (ver20) r[m++] = {b + 0x23c, 0};         // RING_IDLEDLY (Wa_16023105232)
+ 			if (firstRC && (e.drmClass == 0 || e.drmClass == 4)) {   // xe_rtp_match_first_render_or_compute
+ 				firstRC = false;
+ 				r[m++] = {0x14800, kMasked};            // RCU_MODE: CCS enable
+ 				if (gNumEngines > 3) r[m++] = {0x14804, kMasked};   // CCS_MODE (extra_regs: more than one CCS)
+-				r[m++] = {0xe7c8, steer};               // LSC_CHICKEN_BIT_0 (18032247524, 14019811474)
+-				r[m++] = {0xe7cc, steer};               // LSC_CHICKEN_BIT_0_UDW (16025250150, 16018712365, 14018471104)
+-				r[m++] = {0xe49c, steer | kMasked};     // ROW_CHICKEN3 (14020338487)
+-				r[m++] = {0xe4c4, steer | kMasked};     // TDL_TSL_CHICKEN (13012615864, 14021821874)
+-				r[m++] = {0xe48c, steer | kMasked};     // ROW_CHICKEN4 (18034896535)
+-				r[m++] = {0xe4f0, steer | kMasked};     // ROW_CHICKEN (16018737384)
+-				r[m++] = {0xe530, steer};               // RT_CTRL DIS_NULL_QUERY (tuning)
+-				if (dssGroupsDiscontiguous()) r[m++] = {0xe5f4, steer | kMasked};   // rb7p: TDL_CHICKEN (18041344222)
++				if (ver20) {
++					r[m++] = {0xe7c8, steer};               // LSC_CHICKEN_BIT_0 (18032247524, 14019811474)
++					r[m++] = {0xe7cc, steer};               // LSC_CHICKEN_BIT_0_UDW (16025250150, 16018712365, 14018471104)
++					r[m++] = {0xe49c, steer | kMasked};     // ROW_CHICKEN3 (14020338487)
++					r[m++] = {0xe4c4, steer | kMasked};     // TDL_TSL_CHICKEN (13012615864, 14021821874)
++					r[m++] = {0xe48c, steer | kMasked};     // ROW_CHICKEN4 (18034896535)
++					r[m++] = {0xe4f0, steer | kMasked};     // ROW_CHICKEN (16018737384)
++					r[m++] = {0xe530, steer};               // RT_CTRL DIS_NULL_QUERY (tuning)
++					if (dssGroupsDiscontiguous()) r[m++] = {0xe5f4, steer | kMasked};   // rb7p: TDL_CHICKEN (18041344222)
++				}
+ 			}
+-			if (e.drmClass == 0) r[m++] = {0xe194, steer | kMasked};   // HALF_SLICE_CHICKEN7 (14021402888, render)
+-			if (e.drmClass == 0) r[m++] = {b + 0xe0, kMasked};        // rb7p: FF_SLICE_CS_CHICKEN1 (FtrPerCtxtPreemption...)
++			if (ver20 && e.drmClass == 0) r[m++] = {0xe194, steer | kMasked};   // HALF_SLICE_CHICKEN7 (14021402888, render)
++			if (ver20 && e.drmClass == 0) r[m++] = {b + 0xe0, kMasked};        // rb7p: FF_SLICE_CS_CHICKEN1 (FtrPerCtxtPreemption...)
+ 			if (gNonpriv) {   // rb7p: RING_FORCE_TO_NONPRIV slots (xe_reg_whitelist_process_engine puts them in reg_sr)
+ 				uint32_t s[12];
+ 				const uint32_t ns = engineNonpriv(e.drmClass, s);
+@@ -2490,7 +2562,8 @@ int IntelXe::loadGuc(bool full, uint32_t gt) {
+ 	ads->ads.scheduler_policies = aG + offsetof(guc_ads_blob, policies);
+ 	ads->ads.gt_system_info = aG + offsetof(guc_ads_blob, system_info);
+ 	ads->ads.private_data = aG + (uint32_t)privOff;
+-	if (full) {   // guc_waklv_init for graphics 20.01: 18024947630, 16022287689, 14022293748/22019794406, 16026508708
++	const bool ver20 = !gXePlat || gXePlat->graphicsVerx100 >= 2000;
++	if (full && ver20) {   // guc_waklv_init for graphics 20.01: 18024947630, 16022287689, 14022293748/22019794406, 16026508708
+ 		static const uint32_t klvs[] = {0x9005u << 16, 0x9007u << 16, 0x9009u << 16, 0x900bu << 16};
+ 		// media 13.01: 16026508708 (RESET_BB_STACK_PTR_ON_VF_SWITCH), 14025515070 (CLR_CS_INDIRECT_RING_STATE, fw >= 70.53)
+ 		static const uint32_t mklvs[] = {0x900bu << 16, 0x900eu << 16};
+@@ -2504,7 +2577,7 @@ int IntelXe::loadGuc(bool full, uint32_t gt) {
+ 	// base_dpa, xe_guc_using_main_gamctrl_queues false) and GGTT, 64 KB each, page_response_timeout_in_us = -1
+ 	// (GUC_PAGE_RES_TIMEOUT_US). The media GT gets none here (Linux sets them on both GTs; a media fault stays a CAT
+ 	// error), so the media GuC's ADS is as before.
+-	const bool um = full && !gt && gUsm;
++	const bool um = full && !gt && gUsm && (!gXePlat || gXePlat->hasUsm);
+ 	if (um) {
+ 		if (!gUmDpa) gUmDpa = umDpaFor(vramUsableEnd());
+ 		if (gUmDpa) {
+@@ -2537,7 +2610,7 @@ int IntelXe::loadGuc(bool full, uint32_t gt) {
+ 		params[GUC_CTL_FEATURE] = 1u << 4 | (gMediaSlpc ? 1u << 2 : 0);   // LITE_RESTORE, ENABLE_SLPC
+ 	} else if (full) {   // guc_init_params_post_hwconfig: feature flags; DUAL_QUEUE WA with CCS on >= 12.70
+ 		params[GUC_CTL_FEATURE] = 1u << 4 | 1u << 2;   // LITE_RESTORE, ENABLE_SLPC
+-		params[GUC_CTL_WA] = 1u << 11;
++		if (!gXePlat || gXePlat->graphicsVerx100 >= 1270) params[GUC_CTL_WA] = 1u << 11;
+ 	}
+ 	// xe_uc_load_hw: xe_huc_upload before xe_guc_upload (media GT only; a failed HuC DMA does not stop the GuC)
+ 	if (full && gt) hucUpload();
+@@ -2546,9 +2619,11 @@ int IntelXe::loadGuc(bool full, uint32_t gt) {
+ 	wr(gt + SOFT_SCRATCH0, 0);
+ 	for (int i = 0; i < GUC_CTL_MAX_DWORDS; i++) wr(gt + SOFT_SCRATCH0 + 4 * (1 + i), params[i]);
+ 
+-	// guc_prepare_xfer (graphics 20: no SRAM-init/MIA-caching bits, GUC_MOCS_INDEX = the MOCS uc_index); GT_PM_CONFIG is
+-	// above 0x40000, so the media GuC writes the same register.
+-	wr(gt + GUC_SHIM_CONTROL, 1u << 1 | 1u << 9 | 1u << 10 | 1u << 15 | (uint32_t)gXePlat->mocsUcIndex << 24);
++	// guc_prepare_xfer (graphics 20: GUC_MOCS_INDEX = the MOCS uc_index; graphics < 20 omits GUC_MOCS_INDEX); GT_PM_CONFIG
++	// is above 0x40000, so the media GuC writes the same register.
++	uint32_t shim = 1u << 1 | 1u << 9 | 1u << 10 | 1u << 15;
++	if (ver20) shim |= (uint32_t)gXePlat->mocsUcIndex << 24;
++	wr(gt + GUC_SHIM_CONTROL, shim);
+ 	wr(GT_PM_CONFIG, 1);
+ 	wr(gt + PMINTRMSK, rd(gt + PMINTRMSK) & ~(1u << 9));
+ 
+@@ -2793,7 +2868,7 @@ static bool gIdledlyDone[2];
+ uint32_t IntelXe::engineNonpriv(uint16_t drmClass, uint32_t *s) {
+ 	constexpr uint32_t RD = 1u << 28, DENY = 1u << 30, RANGE_4 = 1u;   // ACCESS_RW is 0
+ 	uint32_t n = 0;
+-	if (drmClass == 0) {
++	if (drmClass == 0 && (!gXePlat || gXePlat->graphicsVerx100 >= 2000)) {
+ 		s[n++] = 0x6210;   // FF_MODE (Wa_14024997852)
+ 		s[n++] = 0x62a8;   // VFLSKPD (Wa_14024997852)
+ 	}
+@@ -2823,7 +2898,8 @@ void IntelXe::engineExtras(uint32_t base, uint16_t drmClass) {
+ 		const uint32_t n = engineNonpriv(drmClass, s);
+ 		for (uint32_t i = 0; i < n; i++) wr(base + 0x4d0 + 4 * i, s[i]);
+ 	}
+-	if (drmClass == 0) wr(base + 0xe0, (1u << 14) << 16 | 1u << 14);   // FF_SLICE_CS_CHICKEN1: FFSC_PERCTX_PREEMPT_CTRL
++	if (drmClass == 0 && (!gXePlat || gXePlat->graphicsVerx100 >= 2000))
++		wr(base + 0xe0, (1u << 14) << 16 | 1u << 14);   // FF_SLICE_CS_CHICKEN1: FFSC_PERCTX_PREEMPT_CTRL
+ }
+ 
+ // xe_gt_has_discontiguous_dss_groups (xe_gt_topology.c:337): walking the DSS enabled for geometry or compute
+@@ -3029,55 +3105,56 @@ int IntelXe::firstBatchSetupOnly() {
+ 	// Engines: RCS0, BCS0 (BCS8 is Linux's USM reserve) and the CCS instances XEHP_FUSE4 CCS_EN_MASK leaves on of those
+ 	// the platform's engine mask has (read_compute_fuses_from_reg), then hw_engine_setup_default_state +
+ 	// xe_hw_engine_enable_ring for each, before the GuC load as in xe_gt_init.
++	const bool ver20 = !gXePlat || gXePlat->graphicsVerx100 >= 2000;
++	const uint32_t rcsLrc = ver20 ? 0x4000u : 0xe000u, ccsLrc = ver20 ? 0x3000u : 0xe000u;
+ 	uint32_t ccs = (rd(0x9114) >> 16) & 0xf & xePlatformEngines(gXePlat, XE_HW_ENGINE_CCS0, 4);
+ 	gNumEngines = 0;
+-	gEngines[gNumEngines++] = {0, 0, 0, 0, 0x2000, 0x4000, 0x2000};       // RENDER: PPHWSP + 3 pages
++	gEngines[gNumEngines++] = {0, 0, 0, 0, 0x2000, rcsLrc, 0x2000};       // RENDER: PPHWSP + 3 (Xe2) or 13 (DG2) pages
+ 	gEngines[gNumEngines++] = {1, 0, 0, 3, 0x22000, 0x2000, hwspOff};      // COPY: PPHWSP + 1 page
+ 	static const uint32_t ccsBase[4] = {0x1a000, 0x1c000, 0x1e000, 0x26000};
+ 	for (uint16_t i = 0, l = 0; i < 4; i++)
+-		if (ccs & 1u << i) gEngines[gNumEngines++] = {4, l++, i, 4, ccsBase[i], 0x3000, 0x3000u + i * 0x1000};   // COMPUTE: + 2 pages
++		if (ccs & 1u << i) gEngines[gNumEngines++] = {4, l++, i, 4, ccsBase[i], ccsLrc, 0x3000u + i * 0x1000};
++	const uint32_t ucMocs = gXePlat ? gXePlat->mocsUcIndex : 3;
+ 	for (uint32_t i = 0; i < gNumEngines; i++) {
+ 		const XeEngine &e = gEngines[i];
+-		uint32_t readMocs = e.drmClass == 4 ? 4 : 3;     // dGFX Xe2 compute reads through the WB MOCS entry
+-		wr(e.base + 0xc4, 0x3f7eu << 16 | 3u << 8 | readMocs << 1);   // RING_CMD_CCTL
+-		wr(e.base + 0x98, ~0u);                                       // RING_HWSTAM
+-		wr(e.base + 0x29c, 8u << 16 | 8u);                            // GFX_MODE: GFX_DISABLE_LEGACY_MODE
+-		// CSFE_CHICKEN1: CS_PRIORITY_MEM_READ, and Wa_16021639441 GHWSP_CSB_REPORT_DIS | PPHWSP_CSB_AND_TIMESTAMP_REPORT_DIS
+-		wr(e.base + 0xd4, 0xc080u << 16 | 0xc080u);
+-		wr(e.base + 0x50, 1u << 28 | 1u << 12);                        // RING_PSMI_CTL: Wa_16023105232
+-		engineExtras(e.base, e.drmClass);   // rb7p: NONPRIV whitelist slots, FF_SLICE_CS_CHICKEN1 (render)
+-		wr(e.base + 0x80, miscG + e.hwsp);                            // RING_HWS_PGA
+-	}
+-	if (ccs) wr(0x14800, 1u << 16 | 1u);                              // RCU_MODE: CCS enable
+-
+-	// xe_wa.c gt_was / engine_was and xe_tuning.c gt_tunings / engine_tunings that match graphics 20.01, applied
+-	// over MMIO before the GuC load as xe_gt_init does (render/compute ones once: first render or compute engine).
+-	// MCR registers take a plain write as a multicast; masked registers get (bits << 16 | bits).
+-	auto setBits = [&](uint32_t r, uint32_t b) { wr(r, rd(r) | b); };
+-	auto masked = [&](uint32_t r, uint32_t b) { wr(r, b << 16 | b); };
+-	auto field = [&](uint32_t r, uint32_t m, uint32_t v) { wr(r, (rd(r) & ~m) | v); };
+-	field(0xb0c8, 0xfffff000, 0x11111000);            // LSN_VC_REG2 weights 1 (16025250150)
+-	setBits(0xe7cc, 1u << 8 | 1u << 15 | 1u << 12);   // LSC_CHICKEN_BIT_0_UDW (16025250150, 16018712365, 14018471104)
+-	setBits(0xe7c8, 1u << 13 | 1u << 26);             // LSC_CHICKEN_BIT_0 (18032247524, 14019811474)
+-	masked(0xe49c, 1u << 14);                         // ROW_CHICKEN3 XE2_EUPEND_CHK_FLUSH_DIS (14020338487)
+-	masked(0xe194, 1u << 6);                          // HALF_SLICE_CHICKEN7 CLEAR_OPTIMIZATION_DISABLE (14021402888)
+-	masked(0xe4c4, 1u << 6 | 1u << 12);               // TDL_TSL_CHICKEN RES_CHK_SPR_DIS, STK_ID_RESTRICT
+-	masked(0xe48c, 1u << 9);                          // ROW_CHICKEN4 DISABLE_TDL_PUSH (18034896535)
+-	masked(0xe4f0, 1u << 1);                          // ROW_CHICKEN EARLY_EOT_DIS (16018737384)
+-	setBits(0xe530, 1u << 10);                        // RT_CTRL DIS_NULL_QUERY (tuning)
+-	field(0xb158, 0x3ff, 0x7f);                       // XEHP_L3SQCREG5 L3 PWM timer (tuning)
+-	wr(0x8828, (rd(0x8828) & ~(1u << 18)) | 1u << 23);   // CCCHKNREG1 compression overfetch (tuning, flat CCS)
+-	setBits(0xb108, 1u << 28);                        // L3SQCREG3 COMPPWOVERFETCHEN (tuning)
+-	setBits(0xb104, 1u << 20);                        // L3SQCREG2 COMPMEMRD256BOVRFETCHEN (tuning)
+-	field(0x4148, 0xf, 0);                            // STATELESS_COMPRESSION_CTRL format 0 (tuning)
+-	// rb7p: 18041344222 (xe_wa.c:394, engine_was: GRAPHICS_VERSION_RANGE(2001, 3000), first render or compute engine,
+-	// xe_rtp_match_gt_has_discontiguous_dss_groups): TDL_CHICKEN EUSTALL_PERF_SAMPLING_DISABLE (MCR 0xe5f4 bit 5, masked)
+-	if (dssGroupsDiscontiguous()) masked(0xe5f4, 1u << 5);
+-	// rb7p: hw_engine_init's adjust_idledly ("Ensure IDLEDLY is lower than MAXCNT", xe_hw_engine.c:724-725), after
+-	// the engine's reg_sr and RING_HWS_PGA as there; probe only (see adjustIdledly)
+-	if (!gIdledlyDone[0]) {
+-		adjustIdledlyAll(0, true);
+-		gIdledlyDone[0] = true;
++		const uint32_t readMocs = (e.drmClass == 4 && ver20) ? 4 : ucMocs;   // dGFX Xe2 compute reads through WB MOCS
++		wr(e.base + 0xc4, 0x3f7eu << 16 | ucMocs << 8 | readMocs << 1);     // RING_CMD_CCTL
++		wr(e.base + 0x98, ~0u);                                             // RING_HWSTAM
++		wr(e.base + 0x29c, 8u << 16 | 8u);                                  // GFX_MODE: GFX_DISABLE_LEGACY_MODE
++		if (ver20) {
++			// CSFE_CHICKEN1: CS_PRIORITY_MEM_READ, and Wa_16021639441
++			wr(e.base + 0xd4, 0xc080u << 16 | 0xc080u);
++			wr(e.base + 0x50, 1u << 28 | 1u << 12);                         // RING_PSMI_CTL: Wa_16023105232
++		}
++		engineExtras(e.base, e.drmClass);   // rb7p: NONPRIV whitelist slots, FF_SLICE_CS_CHICKEN1 (render on Xe2)
++		wr(e.base + 0x80, miscG + e.hwsp);                                  // RING_HWS_PGA
++	}
++	if (ccs) wr(0x14800, 1u << 16 | 1u);                                    // RCU_MODE: CCS enable
++
++	if (ver20) {
++		// xe_wa.c gt_was / engine_was and xe_tuning.c gt_tunings / engine_tunings for graphics 20.01
++		auto setBits = [&](uint32_t r, uint32_t b) { wr(r, rd(r) | b); };
++		auto masked = [&](uint32_t r, uint32_t b) { wr(r, b << 16 | b); };
++		auto field = [&](uint32_t r, uint32_t m, uint32_t v) { wr(r, (rd(r) & ~m) | v); };
++		field(0xb0c8, 0xfffff000, 0x11111000);            // LSN_VC_REG2 weights 1 (16025250150)
++		setBits(0xe7cc, 1u << 8 | 1u << 15 | 1u << 12);   // LSC_CHICKEN_BIT_0_UDW (16025250150, 16018712365, 14018471104)
++		setBits(0xe7c8, 1u << 13 | 1u << 26);             // LSC_CHICKEN_BIT_0 (18032247524, 14019811474)
++		masked(0xe49c, 1u << 14);                         // ROW_CHICKEN3 XE2_EUPEND_CHK_FLUSH_DIS (14020338487)
++		masked(0xe194, 1u << 6);                          // HALF_SLICE_CHICKEN7 CLEAR_OPTIMIZATION_DISABLE (14021402888)
++		masked(0xe4c4, 1u << 6 | 1u << 12);               // TDL_TSL_CHICKEN RES_CHK_SPR_DIS, STK_ID_RESTRICT
++		masked(0xe48c, 1u << 9);                          // ROW_CHICKEN4 DISABLE_TDL_PUSH (18034896535)
++		masked(0xe4f0, 1u << 1);                          // ROW_CHICKEN EARLY_EOT_DIS (16018737384)
++		setBits(0xe530, 1u << 10);                        // RT_CTRL DIS_NULL_QUERY (tuning)
++		field(0xb158, 0x3ff, 0x7f);                       // XEHP_L3SQCREG5 L3 PWM timer (tuning)
++		wr(0x8828, (rd(0x8828) & ~(1u << 18)) | 1u << 23);   // CCCHKNREG1 compression overfetch (tuning, flat CCS)
++		setBits(0xb108, 1u << 28);                        // L3SQCREG3 COMPPWOVERFETCHEN (tuning)
++		setBits(0xb104, 1u << 20);                        // L3SQCREG2 COMPMEMRD256BOVRFETCHEN (tuning)
++		field(0x4148, 0xf, 0);                            // STATELESS_COMPRESSION_CTRL format 0 (tuning)
++		if (dssGroupsDiscontiguous()) masked(0xe5f4, 1u << 5);
++		if (!gIdledlyDone[0]) {
++			adjustIdledlyAll(0, true);
++			gIdledlyDone[0] = true;
++		}
+ 	}
+ 	say("engines: RCS0 BCS0 CCS mask 0x%x\n", ccs);
+ 	forcewake(false);
+@@ -3124,7 +3201,7 @@ int IntelXe::firstBatch() {
+ 	bzero(l, lrcMem->getLength());
+ 	auto *ring = reinterpret_cast<uint32_t *>(l);
+ 	auto *regs = reinterpret_cast<uint32_t *>(l + ringSize + 0x1000);
+-	lrcSetOffsets(regs, xe2_bcs_offsets, bcs);
++	lrcSetOffsets(regs, lrcRegOffsets(gXePlat ? gXePlat->graphicsVerx100 : 2001, 1), bcs);
+ 	regs[CTX_CONTEXT_CONTROL] = (1u << 3 | 1u) << 16 | (1u << 3 | 1u);   // INHIBIT_SYN_CTX_SWITCH, ENGINE_CTX_RESTORE_INHIBIT
+ 	regs[CTX_RING_START] = lrcG;
+ 	regs[CTX_RING_CTL] = (ringSize - 0x1000) | 1;
+@@ -3220,9 +3297,11 @@ int IntelXe::vramTest() {
+ 	}
+ 	say("BAR2 phys 0x%llx len 0x%llx\n", bar2->getPhysicalAddress(), bar2->getLength());
+ 	if (!forcewake(true)) return ETIMEDOUT;
+-	// xe_gt_enable_host_l2_vram (Wa_16023588340, graphics 20.01)
+-	wr(0x4194, rd(0x4194) | 1u << 6);   // XE2_GAMREQSTRM_CTRL: CG_DIS_CNTLBUS
+-	wr(0xb194 + 3 * 8, 0xf);             // XEHPC_L3CLOS_MASK(3)
++	const bool ver20 = !gXePlat || gXePlat->graphicsVerx100 >= 2000;
++	if (ver20) {   // xe_gt_enable_host_l2_vram (Wa_16023588340, graphics 20.01)
++		wr(0x4194, rd(0x4194) | 1u << 6);   // XE2_GAMREQSTRM_CTRL: CG_DIS_CNTLBUS
++		wr(0xb194 + 3 * 8, 0xf);             // XEHPC_L3CLOS_MASK(3)
++	}
+ 
+ 	// CPU only: 4 KB pattern at three places in the CPU-visible window.
+ 	auto *v = reinterpret_cast<volatile uint32_t *>(bar2->getVirtualAddress());
+@@ -3245,9 +3324,14 @@ int IntelXe::vramTest() {
+ 	volatile uint32_t *cpu = v + dpa / 4;
+ 	cpu[0] = 0;
+ 	asm volatile("sfence" : : : "memory");
+-	reinterpret_cast<volatile uint64_t *>(bar0->getVirtualAddress() + 0x800000)[vramG >> 12] = dpa | 1 | 1ull << 1 | 1ull << 53;
+-	wr(PVC_GUC_TLB_INV_DESC1, 1u << 6);
+-	wr(PVC_GUC_TLB_INV_DESC0, 1u << 0);
++	const uint64_t pat = (!gXePlat || gXePlat->graphicsVerx100 >= 1270) ? (1ull << 53) : 0;
++	reinterpret_cast<volatile uint64_t *>(bar0->getVirtualAddress() + 0x800000)[vramG >> 12] = dpa | 1 | 1ull << 1 | pat;
++	if (!ver20) {
++		wr(GUC_TLB_INV_CR, 1u << 0);
++	} else {
++		wr(PVC_GUC_TLB_INV_DESC1, 1u << 6);
++		wr(PVC_GUC_TLB_INV_DESC0, 1u << 0);
++	}
+ 	auto *target = reinterpret_cast<volatile uint32_t *>(static_cast<uint8_t *>(miscMem->getBytesNoCopy()) + targetOff);
+ 	const uint32_t job[] = {
+ 		MI_STORE_DATA_IMM | MI_SDI_GGTT | MI_SDI_NUM_DW(1), vramG, 0, 0x0b580e3a,
+@@ -3256,9 +3340,12 @@ int IntelXe::vramTest() {
+ 	int err = submit(job, 8, target, 0x2, 2000);
+ 	if (!err) {
+ 		uint32_t before = cpu[0];
+-		wr(0xb404, 1);   // XE2_GLOBAL_INVAL
+-		uint32_t gi;
+-		bool ok = waitFor(0xb404, 1, 0, 1000, &gi);
++		bool ok = true;
++		if (ver20) {
++			wr(0xb404, 1);   // XE2_GLOBAL_INVAL
++			uint32_t gi;
++			ok = waitFor(0xb404, 1, 0, 1000, &gi);
++		}
+ 		say("GPU->VRAM: CPU reads 0x%08x before L2 flush, 0x%08x after (flush %s) -> %s\n", before, cpu[0],
+ 			ok ? "done" : "TIMEOUT", cpu[0] == 0x0b580e3a ? "VRAM WRITE SEEN" : "not seen");
+ 		if (cpu[0] != 0x0b580e3a) err = EIO;
+@@ -3308,7 +3395,7 @@ int IntelXe::ppgttTest() {
+ 	bzero(l, lrc1Mem->getLength());
+ 	auto *ring = reinterpret_cast<uint32_t *>(l);
+ 	auto *regs = reinterpret_cast<uint32_t *>(l + ringSize + 0x1000);
+-	lrcSetOffsets(regs, xe2_bcs_offsets, bcs);
++	lrcSetOffsets(regs, lrcRegOffsets(gXePlat ? gXePlat->graphicsVerx100 : 2001, 1), bcs);
+ 	regs[CTX_CONTEXT_CONTROL] = (1u << 3 | 1u) << 16 | (1u << 3 | 1u);
+ 	regs[CTX_RING_START] = lrc1G;
+ 	regs[CTX_RING_CTL] = (ringSize - 0x1000) | 1;
+@@ -3391,6 +3478,7 @@ bool IntelXe::mediaEngineWake(bool on) {
+ // (xe_hw_engine_enable_ring), then the GuC load and CT. Power gating stays as found (Linux enables it in
+ // xe_gt_idle_enable_pg, minus VDN0/2 for Wa_14020316580).
+ int IntelXe::mediaGucLoad() {
++	if (gXePlat && gXePlat->maxGtPerTile < 2) return ENODEV;
+ 	constexpr uint32_t M = MEDIA_GT_GSI_OFFSET;
+ 	if (!mapBar0()) return ENXIO;
+ 	if (!mMiscMem) mMiscMem = alloc(mMiscSize, false);
+diff --git a/kernel/IntelXe/IntelXe.h b/kernel/IntelXe/IntelXe.h
+index 2ee5f09..255d769 100644
+--- a/kernel/IntelXe/IntelXe.h
++++ b/kernel/IntelXe/IntelXe.h
+@@ -28,6 +28,8 @@ static constexpr uint32_t FORCEWAKE_ACK_RENDER = 0xd84;
+ static constexpr uint32_t FORCEWAKE_ACK_GT_MTL = 0xdfc;    // Xe2 GT domain ack (graphics_verx100 >= 1270)
+ static constexpr uint32_t GLOBAL_MOCS0 = 0x4000;           // XEHP_GLOBAL_MOCS(i), MCR, multicast write
+ static constexpr uint32_t PAT_ATS = 0x47fc, PAT_PTA = 0x4820;
++static constexpr uint32_t XEHP_FLAT_CCS_BASE_ADDR = 0x4910; // bits 31:8 in 64 KB units (DG2 MCR)
++static constexpr uint32_t XEHP_LNCFCMOCS0 = 0xb020;         // 32 dwords (64 x 16-bit L3CC entries, MCR)
+ static constexpr uint32_t GUC_STATUS = 0xc000;             // AUTH 31:30, MIA 18:16, UKERNEL 15:8, BOOTROM 7:1
+ static constexpr uint32_t BOOT_HASH_CHK = 0xc010, GUC_HEADER_INFO = 0xc014;
+ static constexpr uint32_t GUC_WOPCM_SIZE = 0xc050;         // SIZE 31:12, LOCKED bit 0
+@@ -37,6 +39,7 @@ static constexpr uint32_t UOS_RSA_SCRATCH0 = 0xc200;
+ static constexpr uint32_t DMA_ADDR_0_LOW = 0xc300, DMA_ADDR_0_HIGH = 0xc304, DMA_ADDR_1_LOW = 0xc308, DMA_ADDR_1_HIGH = 0xc30c;
+ static constexpr uint32_t DMA_COPY_SIZE = 0xc310, DMA_CTRL = 0xc314;
+ static constexpr uint32_t DMA_GUC_WOPCM_OFFSET = 0xc340;   // OFFSET 31:14, VALID bit 0
++static constexpr uint32_t GUC_TLB_INV_CR = 0xcee8;            // graphics < 20 GGTT TLB invalidation
+ static constexpr uint32_t PVC_GUC_TLB_INV_DESC0 = 0xcf7c, PVC_GUC_TLB_INV_DESC1 = 0xcf80;
+ static constexpr uint32_t XELP_EU_ENABLE = 0x9134;
+ static constexpr uint32_t XELP_GT_GEOMETRY_DSS_ENABLE = 0x913c;
+@@ -55,8 +58,12 @@ static constexpr uint32_t GSMBASE = 0x108100;
+ static constexpr uint32_t STOLEN_RESERVED = 0x1082c0;
+ static constexpr uint32_t SG_TILE_ADDR_RANGE0 = 0x1083a0;  // size GB 17:8, offset GB 7:1
+ static constexpr uint32_t FORCEWAKE_ACK_GT = 0x130044;
++static constexpr uint32_t GT_CORE_STATUS = 0x138060;        // RCN_MASK 2:0 (pre-12.70 GT C-state)
+ static constexpr uint32_t BMG_FAN_1_SPEED = 0x138140;
++static constexpr uint32_t GT_PERF_STATUS = 0x1381b4;        // CAGF 19:11 in 50/3 MHz units (pre-12.70)
+ static constexpr uint32_t BMG_VRAM_TEMPERATURE = 0x1382c0;
++static constexpr uint32_t RP_STATE_CAP_SNB = 0x145998;      // MCHBAR_MIRROR_BASE_SNB + 0x5998 (50 MHz units)
++static constexpr uint32_t FREQ_INFO_REC = 0x145ef0;         // RPE 15:8, RPA 31:16 (50 MHz units)
+ static constexpr uint32_t PCODE_SCRATCH0 = 0x138320;       // BOOT_STATUS 3:1 (4 critical, 7 non-critical failure)
+ static constexpr uint32_t BMG_PCIE_CAP = 0x138340;
+ static constexpr uint32_t BMG_PACKAGE_TEMPERATURE = 0x138434;
+@@ -285,7 +292,7 @@ static constexpr uint32_t hwspOff = 0, targetOff = 0x1000;
+ static constexpr uint32_t ringSize = 0x4000, lrcSize = 0x2000;                         // copy class: PPHWSP + 1 page
+ // Misc pages: BCS0 HWSP at 0, test target at 0x1000, per-engine HWSPs from 0x2000 (RCS0, CCS0-3), zeroed golden
+ // contexts per GuC class (xe_gt_lrc_size: copy 8 KB, render 16 KB, compute 12 KB on Xe2).
+-static constexpr uint32_t goldenOff = 0x8000, goldenRcsOff = 0xa000, goldenCcsOff = 0xe000, miscSize = 0x11000;
++static constexpr uint32_t goldenOff = 0x8000, goldenRcsOff = 0xa000, goldenCcsOff = 0x18000, miscSize = 0x26000;
+ 
+ // The primary GT's engines (xe_hw_engine.c engine_infos) this driver drives.
+ struct XeEngine {
+diff --git a/kernel/IntelXe/IntelXeClient.cpp b/kernel/IntelXe/IntelXeClient.cpp
+index 2feef13..f7dc5b2 100644
+--- a/kernel/IntelXe/IntelXeClient.cpp
++++ b/kernel/IntelXe/IntelXeClient.cpp
+@@ -184,6 +184,10 @@ IOReturn IOAccelIntelXeClient::clientMemoryForType(UInt32 type, IOOptionBits *op
+ }
+ 
+ bool IntelXe::l2Flush() {
++	if (gXePlat && gXePlat->graphicsVerx100 < 2000) {
++		deviceWmb();
++		return true;
++	}
+ 	if (!forcewake(true)) return false;
+ 	wr(0xb404, 1);   // XE2_GLOBAL_INVAL
+ 	uint32_t last = 0;
+@@ -386,5 +390,45 @@ IOReturn IntelXe::callPlatformFunction(const OSSymbol *fn, bool wait, void *p1,
+ 		xeDispBoostIdle();
+ 		return kIOReturnSuccess;
+ 	}
++	if (fn && p1 && fn->isEqualTo("intelxeGetDeviceInfo")) {
++		struct IntelXeDeviceInfo {
++			uint32_t version;
++			uint32_t platform;
++			uint16_t deviceId;
++			uint16_t graphicsVerx100;
++			uint16_t mediaVerx100;
++			uint16_t displayVer;
++			uint8_t bar2Mapped;
++			uint8_t hasFlatCcs;
++			uint8_t hasDisplay;
++			uint8_t up;
++			uint64_t bar2Length;
++		};
++		auto *r = static_cast<IntelXeDeviceInfo *>(p1);
++		if (!r || r->version != 1) return kIOReturnBadArgument;
++		const XePlatformDesc *plat = gXePlat;
++		r->platform = plat ? (uint32_t)plat->platform : 0u;
++		r->deviceId = gXePlatId ? gXePlatId : devId;
++		r->graphicsVerx100 = plat ? plat->graphicsVerx100 : 0;
++		r->mediaVerx100 = plat ? plat->mediaVerx100 : 0;
++		uint16_t dv = 0;
++		if (!plat || plat->hasDisplay) {
++			switch (plat ? plat->platform : XE_PLATFORM_UNINITIALIZED) {
++			case XE_DG2: dv = 13; break;
++			case XE_METEORLAKE:
++			case XE_BATTLEMAGE: dv = 14; break;
++			case XE_LUNARLAKE: dv = 20; break;
++			case XE_PANTHERLAKE: dv = 30; break;
++			default: dv = (plat && plat->graphicsVerx100 < 1270) ? 12 : 14; break;
++			}
++		}
++		r->displayVer = dv;
++		r->bar2Mapped = bar2 ? 1 : 0;
++		r->hasFlatCcs = (plat && plat->hasFlatCcs) ? 1 : 0;
++		r->hasDisplay = (!plat || plat->hasDisplay) ? 1 : 0;
++		r->up = up ? 1 : 0;
++		r->bar2Length = bar2 ? (uint64_t)bar2->getLength() : 0ull;
++		return kIOReturnSuccess;
++	}
+ 	return IOService::callPlatformFunction(fn, wait, p1, p2, p3, p4);
+ }
+diff --git a/kernel/IntelXe/build.py b/kernel/IntelXe/build.py
+index 335bdb3..43679b9 100644
+--- a/kernel/IntelXe/build.py
++++ b/kernel/IntelXe/build.py
+@@ -27,15 +27,29 @@ HERE=Path(__file__).resolve().parent          # kernel/IntelXe
+ REPO=HERE.parent.parent
+ FBDIR=HERE.parent/'IntelXeFB'                    # kernel/IntelXeFB
+ VER=(REPO/'VERSION').read_text().strip()       # the release that last rebuilt the kext
+-GUC='bmg_guc_70.bin'
+-GUC_SHA='de81c75f46a127c33cd59f604d800e9ffc7ed3495967ba0d8767cd6985ab398b'  # GuC 70.72.1
+-HUC='bmg_huc.bin'
+-HUC_SHA='747452aa8c4ed7760c68a80f3d913eafde9304d6f4db481e3f2aebb0a818bf15'  # HuC 8.2.10
++PLATFORM_FW = {
++ 'bmg': dict(
++  guc='bmg_guc_70.bin',
++  guc_sha='de81c75f46a127c33cd59f604d800e9ffc7ed3495967ba0d8767cd6985ab398b',  # GuC 70.72.1
++  huc='bmg_huc.bin',
++  huc_sha='747452aa8c4ed7760c68a80f3d913eafde9304d6f4db481e3f2aebb0a818bf15',  # HuC 8.2.10
++  fetch_hint='firmware/fetch.sh',
++ ),
++ 'dg2': dict(
++  guc='dg2_guc_70.bin',
++  guc_sha='e6e3f8b4480ba976c89c491ac736d6ce41fa82e0cf5726d0763142da3fe8a63b',  # GuC 70.53.0
++  huc=None,
++  huc_sha=None,
++  fetch_hint='firmware/fetch.sh --probe dg2',
++ ),
++}
+ # BMG-G31 (Arc Pro B70; xe_platform.cpp kIdsBMGG31): not supported, so not in the IOPCIMatch of the supported cards. Both
+ # kexts match it in a personality of its own ("<kext>-G31"); IntelXe::start refuses it unless the tester boot-arg
+ # -intelxe_allow_g31 is set (the entry's testerBootArg), and IntelXeFB attaches only after IntelXe brought the card up
+ # (IntelXeReady). tools/parity/devices.py checks these ids against the kernel's G31 entry.
+ G31_TESTER_MATCH='0xe2208086 0xe2218086 0xe2228086 0xe2238086'
++# DG2 Milestone 1 bring-up (Arc A750 0x56A1; xe_platform.cpp dg2): gated by -intelxe_allow_dg2.
++DG2_TESTER_MATCH='0x56a18086'
+ def run(cmd): subprocess.run([str(x) for x in cmd],check=True,cwd=HERE)
+ def main():
+  p=argparse.ArgumentParser(description=__doc__,formatter_class=argparse.RawDescriptionHelpFormatter)
+@@ -47,6 +61,7 @@ def main():
+   help='MacKernelSDK checkout (default: $MACKERNELSDK or <repo>/external/MacKernelSDK)')
+  p.add_argument('--firmware',type=Path,default=REPO/'firmware',help='directory with bmg_guc_70.bin and bmg_huc.bin')
+  p.add_argument('--only',choices=['IntelXe','IntelXeFB'],help='build one kext only')
++ p.add_argument('--platform',choices=['bmg','dg2'],default='bmg',help='firmware set to embed (default: bmg; dg2 embeds GuC-only dg2_guc_70.bin)')
+  p.add_argument('--surfvram',type=int,choices=range(0,4),help='IntelXeSurfVramDefault in the personality: debug.intelxe.surfvram at boot (boot-arg intelxe_surfvram=N wins)')
+  a=p.parse_args();out=a.output.resolve()
+  sdk=a.sdk.resolve()
+@@ -60,11 +75,16 @@ def main():
+   '-DDRIVER_PRIVATE','-DAPPLE','-DNeXT','-fno-common','-Wall','-Wextra','-Wno-unused-parameter','-Wno-deprecated-declarations',
+   '-fdebug-compilation-dir=.']
+  if a.only in (None,'IntelXe'):
+-  for fwname,sha,name,inc in ((GUC,GUC_SHA,'kGucFw','guc_fw.inc'),(HUC,HUC_SHA,'kHucFw','huc_fw.inc')):
++  fwcfg=PLATFORM_FW[a.platform]
++  for fwname,sha,name,inc in ((fwcfg['guc'],fwcfg['guc_sha'],'kGucFw','guc_fw.inc'),(fwcfg['huc'],fwcfg['huc_sha'],'kHucFw','huc_fw.inc')):
++   if fwname is None:
++    (objdir/inc).write_text(f'static const uint8_t {name}[1] __attribute__((aligned(16))) = {{0}};\nstatic const uint32_t {name}Size = 0;\nstatic const char {name}Name[] = "";\n')
++    continue
+    src=a.firmware.resolve()/fwname
+-   if not src.is_file(): sys.exit(f'{src} is missing: run firmware/fetch.sh first')
++   if not src.is_file(): sys.exit(f'{src} is missing: run {fwcfg["fetch_hint"]} first')
+    fw=src.read_bytes()
+-   assert hashlib.sha256(fw).hexdigest()==sha, f'{src}: unexpected sha256'
++   got_sha=hashlib.sha256(fw).hexdigest()
++   assert got_sha==sha, f'{src}: unexpected sha256 (expected {sha}, got {got_sha}; run {fwcfg["fetch_hint"]})'
+    (objdir/inc).write_text(f'static const uint8_t {name}[] __attribute__((aligned(16))) = {{\n'+
+     '\n'.join(','.join(str(b) for b in fw[i:i+64])+',' for i in range(0,len(fw),64))+f'\n}};\nstatic const uint32_t {name}Size = {len(fw)};\n'+
+     f'static const char {name}Name[] = "{fwname}";\n')   # IntelXe::start: the platform descriptor must name this file
+@@ -115,6 +135,7 @@ def main():
+    CFBundleShortVersionString=VER,OSBundleCompatibleVersion='0.1.0',OSBundleLibraries=libs,
+    IOKitPersonalities={name:dict(CFBundleIdentifier=ident,IOClass=ioclass or name,IOProviderClass='IOPCIDevice',IOPCIMatch='0xe20b8086 0xe20c8086 0xe2118086 0xe2128086',**personality),
+     f'{name}-G31':dict(CFBundleIdentifier=ident,IOClass=ioclass or name,IOProviderClass='IOPCIDevice',IOPCIMatch=G31_TESTER_MATCH,**personality),
++    f'{name}-DG2':dict(CFBundleIdentifier=ident,IOClass=ioclass or name,IOProviderClass='IOPCIDevice',IOPCIMatch=DG2_TESTER_MATCH,**personality),
+     **{k:dict(CFBundleIdentifier=ident,**v) for k,v in more.items()}},**extra)
+   (bundle/'Info.plist').write_bytes(plistlib.dumps(info))
+   syms=subprocess.check_output(['xcrun','nm','-u',str(exe)],text=True)
+diff --git a/kernel/IntelXe/lrc.h b/kernel/IntelXe/lrc.h
+index ef72efc..e7f4d68 100644
+--- a/kernel/IntelXe/lrc.h
++++ b/kernel/IntelXe/lrc.h
+@@ -50,9 +50,8 @@
+ 
+ static const uint8_t xe2_rcs_offsets[] = {
+ 	XE2_CTX_COMMON,
+-	LRC_NOP(2),
+-	LRC_LRI(2, LRC_POSTED),
+-	LRC_REG16(0x5a8), LRC_REG16(0x5ac),
++	LRC_LRI(3, LRC_POSTED),
++	LRC_REG(0x1b0), LRC_REG16(0x5a8), LRC_REG16(0x5ac),
+ 	LRC_NOP(6),
+ 	LRC_LRI(1, 0),
+ 	LRC_REG(0x0c8),
+@@ -64,6 +63,50 @@ static const uint8_t xe2_xcs_offsets[] = {
+ 	0
+ };
+ 
++static const uint8_t gen12_xcs_offsets[] = {
++	LRC_NOP(1),
++	LRC_LRI(13, LRC_POSTED),
++	LRC_REG16(0x244), LRC_REG(0x034), LRC_REG(0x030), LRC_REG(0x038), LRC_REG(0x03c), LRC_REG(0x168), LRC_REG(0x140),
++	LRC_REG(0x110), LRC_REG(0x1c0), LRC_REG(0x1c4), LRC_REG(0x1c8), LRC_REG(0x180), LRC_REG16(0x2b4),
++	LRC_NOP(5),
++	LRC_LRI(9, LRC_POSTED),
++	LRC_REG16(0x3a8), LRC_REG16(0x28c), LRC_REG16(0x288), LRC_REG16(0x284), LRC_REG16(0x280), LRC_REG16(0x27c),
++	LRC_REG16(0x278), LRC_REG16(0x274), LRC_REG16(0x270),
++	0
++};
++
++static const uint8_t dg2_xcs_offsets[] = {
++	LRC_NOP(1),
++	LRC_LRI(15, LRC_POSTED),
++	LRC_REG16(0x244), LRC_REG(0x034), LRC_REG(0x030), LRC_REG(0x038), LRC_REG(0x03c), LRC_REG(0x168), LRC_REG(0x140),
++	LRC_REG(0x110), LRC_REG(0x1c0), LRC_REG(0x1c4), LRC_REG(0x1c8), LRC_REG(0x180), LRC_REG16(0x2b4), LRC_REG(0x120),
++	LRC_REG(0x124),
++	LRC_NOP(1),
++	LRC_LRI(9, LRC_POSTED),
++	LRC_REG16(0x3a8), LRC_REG16(0x28c), LRC_REG16(0x288), LRC_REG16(0x284), LRC_REG16(0x280), LRC_REG16(0x27c),
++	LRC_REG16(0x278), LRC_REG16(0x274), LRC_REG16(0x270),
++	0
++};
++
++static const uint8_t dg2_rcs_offsets[] = {
++	LRC_NOP(1),
++	LRC_LRI(15, LRC_POSTED),
++	LRC_REG16(0x244), LRC_REG(0x034), LRC_REG(0x030), LRC_REG(0x038), LRC_REG(0x03c), LRC_REG(0x168), LRC_REG(0x140),
++	LRC_REG(0x110), LRC_REG(0x1c0), LRC_REG(0x1c4), LRC_REG(0x1c8), LRC_REG(0x180), LRC_REG16(0x2b4), LRC_REG(0x120),
++	LRC_REG(0x124),
++	LRC_NOP(1),
++	LRC_LRI(9, LRC_POSTED),
++	LRC_REG16(0x3a8), LRC_REG16(0x28c), LRC_REG16(0x288), LRC_REG16(0x284), LRC_REG16(0x280), LRC_REG16(0x27c),
++	LRC_REG16(0x278), LRC_REG16(0x274), LRC_REG16(0x270),
++	LRC_NOP(2),
++	LRC_LRI(2, LRC_POSTED),
++	LRC_REG16(0x5a8), LRC_REG16(0x5ac),
++	LRC_NOP(6),
++	LRC_LRI(1, 0),
++	LRC_REG(0x0c8),
++	0
++};
++
+ static const uint8_t xe2_bcs_offsets[] = {
+ 	LRC_NOP(1),
+ 	LRC_LRI(15, LRC_POSTED),
+@@ -130,3 +173,13 @@ static inline void lrcSetOffsets(uint32_t *regs, const uint8_t *data, uint32_t b
+ 	}
+ 	*regs = MI_BATCH_BUFFER_END | 1;
+ }
++
++// Matches Linux drivers/gpu/drm/xe/xe_lrc.c reg_offsets() (and xe_probe.cpp):
++// XE_ENGINE_CLASS_COPY (drmClass == 1) uses gen12_xcs_offsets on all < 20.00 (including DG2 12.55);
++// CCS/VCS/VECS use dg2_xcs_offsets on >= 12.55 and gen12_xcs_offsets below 12.55.
++static inline const uint8_t *lrcRegOffsets(uint16_t graphicsVerx100, uint16_t drmClass) {
++	if (drmClass == 0) return graphicsVerx100 >= 2000 ? xe2_rcs_offsets : dg2_rcs_offsets;
++	if (drmClass == 1) return graphicsVerx100 >= 2000 ? xe2_bcs_offsets : gen12_xcs_offsets;
++	if (graphicsVerx100 >= 2000) return xe2_xcs_offsets;
++	return graphicsVerx100 >= 1255 ? dg2_xcs_offsets : gen12_xcs_offsets;
++}
+diff --git a/kernel/IntelXe/xe_core.cpp b/kernel/IntelXe/xe_core.cpp
+index 82544e3..84e1e7a 100644
+--- a/kernel/IntelXe/xe_core.cpp
++++ b/kernel/IntelXe/xe_core.cpp
+@@ -1200,8 +1200,19 @@ uint32_t IntelXe::slpcMinSet(uint32_t min, uint32_t rpe) {
+ // The floor is the administrator's (slpc_min), raised to an active slpc_boost lease's (xeBoostEffectiveMin), so that a
+ // GT reset during a lease keeps it.
+ void IntelXe::slpcParams() {
+-	const uint32_t cap = rd(0x138000), rp0 = mhzOf(cap & 0x1ff), rpn = mhzOf(cap >> 16 & 0x1ff),
++	uint32_t rp0 = 0, rpn = 0, rpe = 0;
++	if (!gXePlat || gXePlat->graphicsVerx100 >= 1270) {
++		const uint32_t cap = rd(0x138000);
++		rp0 = mhzOf(cap & 0x1ff);
++		rpn = mhzOf(cap >> 16 & 0x1ff);
+ 		rpe = mhzOf(rd(0x13800c) & 0x1ff);
++	} else {
++		const uint32_t cap = rd(RP_STATE_CAP_SNB), rec = rd(FREQ_INFO_REC);
++		rp0 = (cap & 0xff) * 50u;
++		rpn = ((cap >> 16) & 0xff) * 50u;
++		rpe = ((rec >> 8) & 0xff) * 50u;
++		if (!rpe) rpe = ((cap >> 8) & 0xff) * 50u;
++	}
+ 	gSlpcRpn = rpn;
+ 	gSlpcRp0 = rp0;
+ 	gSlpcRpe = rpe;
+@@ -1588,18 +1599,19 @@ bool IntelXe::fwHold(bool on) {
+ 	if (!mapBar0()) return false;
+ 	// the GT and the render domain (RC6 is the render well's power-down), requester bit 1 in both, as forcewake() takes
+ 	// bit 0; released in the reverse order
++	const uint32_t ackGtReg = (!gXePlat || gXePlat->graphicsVerx100 >= 1270) ? FORCEWAKE_ACK_GT_MTL : FORCEWAKE_ACK_GT;
+ 	uint32_t ack = 0, rack = 0;
+ 	bool ok;
+ 	if (on) {
+ 		wr(FORCEWAKE_GT, 0x20002);
+-		ok = waitFor(FORCEWAKE_ACK_GT_MTL, 2, 2, 50000, &ack);
++		ok = waitFor(ackGtReg, 2, 2, 50000, &ack);
+ 		wr(FORCEWAKE_RENDER, 0x20002);
+ 		ok = waitFor(FORCEWAKE_ACK_RENDER, 2, 2, 50000, &rack) && ok;
+ 	} else {
+ 		wr(FORCEWAKE_RENDER, 0x20000);
+ 		ok = waitFor(FORCEWAKE_ACK_RENDER, 2, 0, 50000, &rack);
+ 		wr(FORCEWAKE_GT, 0x20000);
+-		ok = waitFor(FORCEWAKE_ACK_GT_MTL, 2, 0, 50000, &ack) && ok;
++		ok = waitFor(ackGtReg, 2, 0, 50000, &ack) && ok;
+ 	}
+ 	LOG("GT+render forcewake hold %s: %s (ack 0x%08x / 0x%08x)", on ? "on" : "off", ok ? "ok" : "NO ACK", ack, rack);
+ 	return ok;
+@@ -1634,16 +1646,18 @@ int IntelXe::slpcStep() {
+ // are readable while the GT sleeps: xe_guc_pc_c_status, xe_guc_pc_rc6_residency), then the RC6/power-gate controls.
+ int IntelXe::powerReport() {
+ 	if (!mapBar0()) return ENXIO;
+-	const uint32_t wp1 = rd(0xc60), rc6a = rd(0x138108), mc6a = rd(0x138048), core = rd(0x138060);
++	const bool ver1270 = !gXePlat || gXePlat->graphicsVerx100 >= 1270;
++	const uint32_t ackGtReg = ver1270 ? FORCEWAKE_ACK_GT_MTL : FORCEWAKE_ACK_GT;
++	const uint32_t wp1 = rd(ver1270 ? 0xc60 : GT_PERF_STATUS), rc6a = rd(0x138108), mc6a = rd(0x138048), core = rd(GT_CORE_STATUS);
+ 	IOSleep(100);   // gDevLock only: GPU clients do not wait for it
+-	const uint32_t rc6b = rd(0x138108), mc6b = rd(0x138048), wp1b = rd(0xc60);
+-	const uint32_t cc = wp1 >> 9 & 0xf, ccb = wp1b >> 9 & 0xf;
+-	say("GT C-state (MTL_MIRROR_TARGET_WP1 12:9) %u then %u (0 = C0, 6 = C6, 15 = deeper/reset), CAGF %u MHz\n", cc, ccb,
+-		mhzOf(wp1 & 0x1ff));
++	const uint32_t rc6b = rd(0x138108), mc6b = rd(0x138048), wp1b = rd(ver1270 ? 0xc60 : GT_PERF_STATUS);
++	const uint32_t cc = ver1270 ? (wp1 >> 9 & 0xf) : (core & 7), ccb = ver1270 ? (wp1b >> 9 & 0xf) : (rd(GT_CORE_STATUS) & 7);
++	const uint32_t cagf = ver1270 ? (wp1 & 0x1ff) : ((wp1 >> 11) & 0x1ff);
++	say("GT C-state %u then %u (0 = C0, 6 = C6, 15 = deeper/reset), CAGF %u MHz\n", cc, ccb, mhzOf(cagf));
+ 	say("RC6 residency %u%% of the last 100 ms (GT_GFX_RC6 %u -> %u, 1.28 us units); media MC6 %u%%; GT_CORE_STATUS 0x%08x\n",
+ 		(uint32_t)((uint64_t)(rc6b - rc6a) * 128 / 100000), rc6a, rc6b, (uint32_t)((uint64_t)(mc6b - mc6a) * 128 / 100000),
+ 		core);
+-	say("forcewake ack GT 0x%08x (bit 0 kernel, bit 1 hold %s)\n", rd(FORCEWAKE_ACK_GT_MTL), gFwHold ? "on" : "off");
++	say("forcewake ack GT 0x%08x (bit 0 kernel, bit 1 hold %s)\n", rd(ackGtReg), gFwHold ? "on" : "off");
+ 	if (!forcewake(true)) return ETIMEDOUT;
+ 	say("RC_CONTROL 0x%08x RC_STATE 0x%08x RC_IDLE_HYSTERSIS 0x%08x POWERGATE_ENABLE 0x%08x; sysctls gucrc %d rc6 %d\n",
+ 		rd(0xa090), rd(0xa094), rd(0xa0ac), rd(0xa210), gGucRc, gRc6Ctl);
+@@ -1662,21 +1676,29 @@ uint64_t IntelXe::vramUsableEnd() {
+ 	const uint64_t tile = (uint64_t)(range >> 8 & 0x3ff) << 30, tileOff = (uint64_t)(range >> 1 & 0x7f) << 30;
+ 	const uint64_t gsm = ((uint64_t)rd(GSMBASE + 4) << 32 | rd(GSMBASE)) & ~0xfffffull;
+ 	const uint64_t dsm = ((uint64_t)rd(DSMBASE + 4) << 32 | rd(DSMBASE)) & ~0xfffffull;   // BDSM_MASK 63:20
+-	const uint32_t lo = rd(0x8800), hi = rd(0x8804), nodes = (uint32_t)__builtin_popcount(rd(0x9118) >> 16);
+-	uint64_t ccs = (((uint64_t)(hi & 0xff) << 32) | (lo & 0xffffffc0u)) * nodes;
+-	ccs &= ~0xfffull;
+ 	const uint64_t ccsSize = tile / 512;
+-	uint64_t end = ccs;
+-	const bool ccsOk = (lo & 1) && tile && ccs > tile / 2 && ccs + ccsSize <= gsm && ccs <= tile;
+-	if (!ccsOk) end = gsm > ccsSize ? gsm - ccsSize : 0;
++	uint64_t ccs = 0;
++	bool ccsOk = false;
++	if (gXePlat && gXePlat->graphicsVerx100 < 2000) {
++		const uint32_t reg = rd(XEHP_FLAT_CCS_BASE_ADDR);
++		ccs = (uint64_t)(reg >> 8) << 16;   // XEHP_FLAT_CCS_PTR (31:8) * 64 KB
++		ccsOk = (reg != ~0u && reg != 0) && tile && ccs > tile / 2 && ccs + ccsSize <= gsm && ccs <= tile;
++		say("VRAM: tile %llu MB at %llu GB, XEHP flat CCS base 0x%llx (reg 0x%08x)%s, DSM 0x%llx, GSM 0x%llx\n",
++			tile >> 20, tileOff >> 30, ccs, reg, ccsOk ? "" : " IMPLAUSIBLE", dsm, gsm);
++	} else {
++		const uint32_t lo = rd(0x8800), hi = rd(0x8804), nodes = (uint32_t)__builtin_popcount(rd(0x9118) >> 16);
++		ccs = ((((uint64_t)(hi & 0xff) << 32) | (lo & 0xffffffc0u)) * nodes) & ~0xfffull;
++		ccsOk = (lo & 1) && tile && ccs > tile / 2 && ccs + ccsSize <= gsm && ccs <= tile;
++		say("VRAM: tile %llu MB at %llu GB, flat CCS base 0x%llx (lower 0x%08x upper 0x%08x, %u L3 nodes)%s, DSM 0x%llx, GSM 0x%llx\n",
++			tile >> 20, tileOff >> 30, ccs, lo, hi, nodes, ccsOk ? "" : " IMPLAUSIBLE", dsm, gsm);
++	}
++	uint64_t end = ccsOk ? ccs : (gsm > ccsSize ? gsm - ccsSize : 0);
+ 	if (dsm && dsm < end) end = dsm;
+ 	if (gsm && gsm < end) end = gsm;
+ 	end = (end - tileOff) & ~0xffffull;
+ 	const bool sane = tile && end >= (1ull << 30) && end <= tile;
+ 	const uint64_t fallback = tile >= (2ull << 30) && tile < (12ull << 30) ? (tile - tile / 12) & ~0xffffull : 0x2c0000000ull;
+-	say("VRAM: tile %llu MB at %llu GB, flat CCS base 0x%llx (lower 0x%08x upper 0x%08x, %u L3 nodes)%s, DSM 0x%llx, GSM "
+-		"0x%llx -> BOs end at 0x%llx%s\n", tile >> 20, tileOff >> 30, ccs, lo, hi, nodes, ccsOk ? "" : " IMPLAUSIBLE",
+-		dsm, gsm, sane ? end : fallback, sane ? "" : " (fallback)");
++	say("VRAM: BOs end at 0x%llx%s\n", sane ? end : fallback, sane ? "" : " (fallback)");
+ 	return sane ? end : fallback;
+ }
+ 
+@@ -1698,7 +1720,8 @@ void IntelXe::schedPolicyInit() {
+ 
+ void IntelXe::pcStart() {
+ 	schedPolicyInit();   // pcStart follows every primary GuC load (bring-up, GT reset, resume)
+-	const uint32_t rp0Raw = rd(0x138000) & 0x1ff;
++	const uint32_t rp0Raw = (!gXePlat || gXePlat->graphicsVerx100 >= 1270) ? (rd(0x138000) & 0x1ff)
++		: ((rd(RP_STATE_CAP_SNB) & 0xff) * 3u);
+ 	if (!gSlpcMem) gSlpcMem = alloc(0x2000, true);
+ 	IOBufferMemoryDescriptor *slpc = gSlpcMem;
+ 	bool slpcUp = false;
+@@ -1743,21 +1766,27 @@ int IntelXe::bringUp() {
+ 		say("bring-up refused: %s has no VRAM and the integrated memory path is not implemented\n", gXePlat->name);
+ 		return ENODEV;
+ 	}
++	const bool ver20 = !gXePlat || gXePlat->graphicsVerx100 >= 2000;
+ 	say("bring-up\n");
+ 	int err = firstBatchSetupOnly();
+ 	if (err) return err;
+ 	if (!bar2) bar2 = pci->mapDeviceMemoryWithRegister(0x18, kIOMapWriteCombineCache);
+-	if (!bar2) return ENXIO;
++	if (!bar2) {
++		if (ver20) return ENXIO;
++		say("BAR2 map failed (ResizeAppleGpuBars=-1 or unmapped 8GB BAR; continuing GuC-only Milestone 1 bring-up)\n");
++	}
+ 	if (!forcewake(true)) return ETIMEDOUT;
+-	vramEnd = vramUsableEnd();
+-	// rb7j: the GuC's UM queues at the top stay out of the BO allocator (set here too, in case no full GuC load came
+-	// first; the GuC loads that follow use the same range)
+-	if (gUsm && !gUmDpa) gUmDpa = umDpaFor(vramEnd);
+-	if (gUsm && gUmDpa && gUmDpa < vramEnd) vramEnd = gUmDpa;
+-	vramVisible = bar2->getLength() < vramEnd ? bar2->getLength() & ~0xffffull : vramEnd;
+-	say("BAR2 window %llu MB, VRAM for BOs %llu MB\n", vramVisible >> 20, vramEnd >> 20);
+-	wr(0x4194, rd(0x4194) | 1u << 6);   // Wa_16023588340: XE2_GAMREQSTRM_CTRL CG_DIS_CNTLBUS
+-	wr(0xb194 + 3 * 8, 0xf);             //                 XEHPC_L3CLOS_MASK(3)
++	if (bar2) {
++		vramEnd = vramUsableEnd();
++		if (gUsm && gXePlat && gXePlat->hasUsm && !gUmDpa) gUmDpa = umDpaFor(vramEnd);
++		if (gUsm && gXePlat && gXePlat->hasUsm && gUmDpa && gUmDpa < vramEnd) vramEnd = gUmDpa;
++		vramVisible = bar2->getLength() < vramEnd ? bar2->getLength() & ~0xffffull : vramEnd;
++		say("BAR2 window %llu MB, VRAM for BOs %llu MB\n", vramVisible >> 20, vramEnd >> 20);
++	}
++	if (ver20) {
++		wr(0x4194, rd(0x4194) | 1u << 6);   // Wa_16023588340: XE2_GAMREQSTRM_CTRL CG_DIS_CNTLBUS
++		wr(0xb194 + 3 * 8, 0xf);             //                 XEHPC_L3CLOS_MASK(3)
++	}
+ 	gGeomDss = rd(XELP_GT_GEOMETRY_DSS_ENABLE);
+ 	gCompDss = rd(XEHP_GT_COMPUTE_DSS_ENABLE);
+ 	gEuMask = rd(XELP_EU_ENABLE);
+@@ -1765,9 +1794,11 @@ int IntelXe::bringUp() {
+ 	gL3Mask = 0;
+ 	for (uint32_t b = 0; b < 16; b++)
+ 		if (fuse3 >> 16 & 1u << b) gL3Mask |= (uint64_t)((fuse3 >> 4) & 0xf) << (b * 4);
+-	// FF_MODE is not masked: keep the power-on value, set DIS_MESH_PARTIAL_AUTOSTRIP | DIS_MESH_AUTOSTRIP and
+-	// VS_HIT_MAX_VALUE 25:20 = 0x3f (Wa_14021490052, lrc tuning)
+-	gFfMode = (rd(0x6210) & ~(0x3fu << 20)) | 1u << 16 | 1u << 15 | 0x3fu << 20;
++	if (ver20) {
++		// FF_MODE is not masked: keep the power-on value, set DIS_MESH_PARTIAL_AUTOSTRIP | DIS_MESH_AUTOSTRIP and
++		// VS_HIT_MAX_VALUE 25:20 = 0x3f (Wa_14021490052, lrc tuning)
++		gFfMode = (rd(0x6210) & ~(0x3fu << 20)) | 1u << 16 | 1u << 15 | 0x3fu << 20;
++	}
+ 	uint32_t c0 = rd(0xd00);             // RPM_CONFIG0 (xe_gt_clock_init)
+ 	static const uint32_t freq[] = {24000000, 19200000, 38400000, 25000000};
+ 	gRefClock = ((c0 >> 3) & 7) < 4 ? freq[(c0 >> 3) & 7] >> (3 - ((c0 >> 1) & 3)) : 0;
+@@ -1778,22 +1809,27 @@ int IntelXe::bringUp() {
+ 	size_t sz = sizeof(gSysTotal);
+ 	sysctlbyname("hw.memsize", &gSysTotal, &sz, nullptr, 0);
+ 
+-	IOLockLock(gResLock);
+-	const bool vramOk = buddyInit(&gVis, vramUserStart, vramVisible) && buddyInit(&gHi, vramVisible, vramEnd);
+-	IOLockUnlock(gResLock);
+-	if (!vramOk) return ENOMEM;
+-	if (scratchInit()) return ENOMEM;
++	if (bar2) {
++		IOLockLock(gResLock);
++		const bool vramOk = buddyInit(&gVis, vramUserStart, vramVisible) && buddyInit(&gHi, vramVisible, vramEnd);
++		IOLockUnlock(gResLock);
++		if (!vramOk) return ENOMEM;
++	}
++	if (ver20 && bar2 && scratchInit()) return ENOMEM;
+ 	if (!gSeqnoMem) gSeqnoMem = alloc(kSlots * kSlotBytes, false);
+ 	if (!gSeqnoMem || ggttMap(gSeqnoMem, seqnoG)) return ENOMEM;
+ 	say("up: DSS 0x%x/0x%x EU 0x%x L3 0x%llx refclk %u, %llu MB RAM\n", gGeomDss, gCompDss, gEuMask, gL3Mask, gRefClock,
+ 		gSysTotal >> 20);
+ 	if (gIrqWanted && !irqOn) irqInit();
+ 	if (irqOn) irqGtEnable();   // also when IntelXeFB's display handler set the MSI up first
+-	recordGolden();
+-	vramClearInit();
+-	// xe_device_probe brings both GTs up: the media GT's GuC, HuC and SLPC now, so its VCS engines are listed from the
+-	// first query (debug.intelxe.video=0 or -intelxe_novideo: not; a failure is retried by mediaUp, at most every 10 s).
+-	if (gVideoWanted) {
++	if (ver20 && bar2) {
++		recordGolden();
++		vramClearInit();
++	} else {
++		gLrcVram = 0;   // Milestone 1 / Small-BAR fallback: keep LRCs out of unmapped BAR2
++	}
++	// xe_device_probe brings both GTs up when a standalone media GT exists (maxGtPerTile >= 2).
++	if (gVideoWanted && (!gXePlat || gXePlat->maxGtPerTile >= 2)) {
+ 		const int merr = mediaGucLoad();
+ 		say("media GT at bring-up: %s (%d)\n", merr ? "FAILED" : "up", merr);
+ 	}
+@@ -3233,7 +3269,7 @@ static int queueCreate(XeVm *vm, uint16_t cls, uint16_t inst, XeQueue **out, con
+ 	}
+ 	auto *ring = reinterpret_cast<uint32_t *>(l);
+ 	auto *regs = reinterpret_cast<uint32_t *>(l + ringSize + 0x1000);
+-	lrcSetOffsets(regs, eng->drmClass == 0 ? xe2_rcs_offsets : eng->drmClass == 1 ? xe2_bcs_offsets : xe2_xcs_offsets,
++	lrcSetOffsets(regs, lrcRegOffsets(gXePlat ? gXePlat->graphicsVerx100 : 2001, eng->drmClass),
+ 		eng->base);
+ 	regs[CTX_CONTEXT_CONTROL] = (1u << 3 | 1u) << 16 | (1u << 3 | 1u);
+ 	regs[CTX_RING_START] = q->lrcGgtt;
+@@ -8982,7 +9018,7 @@ int xeResume() {
+ // Scan-out and cursor buffers: contiguous VRAM inside the BAR window (the display reads it through GGTT PTEs IntelXeFB
+ // writes, the CPU through BAR2), held by a kernel BO until freed; zeroed by the copy engine if asked (waited for).
+ int xeDispVramAlloc(uint64_t size, uint32_t flags, uint64_t *dpa, void **cookie) {
+-	if (!gDev->up) return ENXIO;
++	if (!gDev || !gDev->up || !gDev->vramMap()) return ENXIO;
+ 	if (!size || size > (1ull << 30)) return EINVAL;
+ 	auto *bo = static_cast<XeBo *>(IOMallocZero(sizeof(XeBo)));
+ 	if (!bo) return ENOMEM;
+diff --git a/kernel/IntelXe/xe_platform.cpp b/kernel/IntelXe/xe_platform.cpp
+index 9b5c5cc..f1fc94c 100644
+--- a/kernel/IntelXe/xe_platform.cpp
++++ b/kernel/IntelXe/xe_platform.cpp
+@@ -112,8 +112,8 @@ constexpr XePlatformDesc dg2(bool atsm) {   // dg2_desc, ats_m_desc (DG2_FEATURE
+ 	d.gucMajor = 70;
+ 	d.gucMinor = 53;
+ 	d.dmcFw = atsm ? nullptr : "i915/dg2_dmc_ver2_08.bin";   // no HuC line for DG2 in XE_HUC_FIRMWARE_DEFS
+-	d.missing = "Xe_HPG (12.55): XeHP LRC images and register lists, xelp PAT / dg2 MOCS, 64K VRAM pages, DG2 "
+-		"workarounds (per G10/G11/G12 stepping), no standalone media GT, i915 GuC 70.53, no HuC in xe";
++	d.testerBootArg = atsm ? nullptr : "intelxe_allow_dg2";
++	d.missing = "Xe_HPG (12.55): Milestone 1 GuC bring-up only (display/Metal/full PPGTT deferred); i915 GuC 70.53, no HuC";
+ 	return mediaXem(graphicsXehpg(d));
+ }
+ constexpr XePlatformDesc mtl(uint16_t gfx) {   // mtl_desc (MTL and ARL)
+diff --git a/kernel/IntelXeFB/IntelXeFB.cpp b/kernel/IntelXeFB/IntelXeFB.cpp
+index 2415de7..d6bcfed 100644
+--- a/kernel/IntelXeFB/IntelXeFB.cpp
++++ b/kernel/IntelXeFB/IntelXeFB.cpp
+@@ -256,10 +256,42 @@ struct NMXPipeGamma {
+ 	unsigned int count;     // kGammaSize or 0
+ 	unsigned int lut[1024];
+ };
+-// DP AUX (Linux intel_dp_aux_regs.h, display 14 = no xe2lpd remap): A 0x64010, B 0x64110, USBC1-4 0x16f210 + n*0x200;
+-// five data registers follow each control register
++// DP AUX (Linux intel_dp_aux_regs.h):
++// Display 14+ (BMG): A 0x64010, B 0x64110, USBC1-4 0x16f210 + n*0x200 (AUX_POWER_REQUEST = bit 19).
++// Display 13 (DG2 / Xe_HPD): A 0x64010, B 0x64110, C 0x64210, USBC1 0x64310, D 0x64710; AUX power wells live in
++// ICL_PWR_WELL_CTL_AUX1/2 (indices 0..3 and 7), not DP_AUX_CH_CTL bit 19.
+ constexpr uint32_t kAuxCtl[6] = { 0x64010, 0x64110, 0x16f210, 0x16f410, 0x16f610, 0x16f810 };
+ constexpr const char *kAuxName[6] = { "A", "B", "USBC1", "USBC2", "USBC3", "USBC4" };
++constexpr uint32_t kAuxCtlDg2[5] = { 0x64010, 0x64110, 0x64210, 0x64310, 0x64710 };
++constexpr const char *kAuxNameDg2[5] = { "A", "B", "C", "USBC1", "D" };
++constexpr int kAuxPwIdxDg2[5] = { 0, 1, 2, 3, 7 };   // XELPD_PW_CTL_IDX_AUX_{A,B,C,USBC1,D_XELPD}
++constexpr uint32_t DC_STATE_EN = 0x45504;
++constexpr uint32_t HSW_PWR_WELL_CTL1 = 0x45400, HSW_PWR_WELL_CTL2 = 0x45404;
++constexpr uint32_t ICL_PWR_WELL_CTL_AUX1 = 0x45440, ICL_PWR_WELL_CTL_AUX2 = 0x45444;
++constexpr uint32_t kXePlatformDg2 = 7;   // XePlatform::XE_DG2
++struct IntelXeDeviceInfo {
++	uint32_t version;
++	uint32_t platform;
++	uint16_t deviceId;
++	uint16_t graphicsVerx100;
++	uint16_t mediaVerx100;
++	uint16_t displayVer;
++	uint8_t bar2Mapped;
++	uint8_t hasFlatCcs;
++	uint8_t hasDisplay;
++	uint8_t up;
++	uint64_t bar2Length;
++};
++static bool isDg2DeviceId(uint16_t id)
++{
++	static const uint16_t kIdsDG2[] = {
++		0x56a0, 0x56a1, 0x56a2, 0x56be, 0x56bf, 0x5690, 0x5691, 0x5692, 0x56a5,
++		0x56a6, 0x56b0, 0x56b1, 0x56ba, 0x56bb, 0x56bc, 0x56bd, 0x5693, 0x5694,
++		0x5695, 0x56a3, 0x56a4, 0x56b2, 0x56b3, 0x5696, 0x5697,
++	};
++	for (uint16_t x : kIdsDG2) if (x == id) return true;
++	return false;
++}
+ constexpr uint32_t AUX_SEND_BUSY = 1u << 31, AUX_DONE = 1u << 30, AUX_TIME_OUT_ERROR = 1u << 28, AUX_TIME_OUT_MAX = 3u << 26;
+ constexpr uint32_t AUX_RECEIVE_ERROR = 1u << 25, AUX_POWER_REQUEST = 1u << 19;
+ // SKL+ sync pulses as intel_dp_aux: fast-wake 18 (10 precharge + 8 preamble), normal 32 (16 + 16), each field = count - 1
+@@ -493,6 +525,9 @@ class IntelXeFramebuffer : public IOFramebuffer {
+ 	volatile bool fStopping = false;
+ 	volatile uint8_t *fRegs = nullptr;
+ 	IOPhysicalAddress fSurfPhys = 0;   // BAR2 physical base + the surface's VRAM address
++	uint16_t fDisplayVer = 14;
++	bool fIsDg2 = false;
++	bool fBar2Mapped = true;
+ 	uint32_t fWidth = 0, fHeight = 0, fRowBytes = 0, fSurf = 0, fRefresh16 = 60 << 16;
+ 	uint64_t fFrameNs = 16666667ull, fDpa = 0;
+ 	uint32_t fHT = 0, fVT = 0, fHSS = 0, fHSE = 0, fVSS = 0, fVSE = 0, fRefreshMilliHz = 60000;
+@@ -798,7 +833,7 @@ private:
+ 		FBLOG("display %s", off ? "asleep: plane off" : "awake: plane on");
+ 		// DPMS (debug.intelxefb_dpms=1): asleep also takes the output down -- transcoder, DDI, PLL off, the sink in D3 -- as
+ 		// Linux's crtc disable does; the wake is a full modeset at the same mode (dpmsWake). Off by default until tested.
+-		if (off && gDpms && fAux) {
++		if (off && gDpms && fAux && fDisplayVer >= 14) {
+ 			int r = linkAction(IntelXeLink::kPowerDown);
+ 			fDpmsDown = r == 0;
+ 			FBLOG("dpms: output %s (%d)", r ? "NOT powered down" : "powered down", r);
+@@ -806,6 +841,7 @@ private:
+ 	}
+ 	volatile bool fDpmsDown = false;
+ 	void dpmsWake() {
++		if (fDisplayVer < 14) { dispLock(); fBlanked = false; dispUnlock(); fDpmsDown = false; return; }
+ 		dispLock(); fBlanked = false; dispUnlock();
+ 		int r = linkAction(IntelXeLink::kModeset);
+ 		if (r) { FBLOG("dpms: wake modeset failed (%d), once more", r); IOSleep(200); r = linkAction(IntelXeLink::kModeset); }
+@@ -893,6 +929,7 @@ private:
+ 	// interrupt path (hpdWork) does. When the panel's own port goes away and comes back, its link is gone: retrain it on
+ 	// a thread call (about 150 ms, the sink's long-pulse case in intel_dp_detect / intel_dp_retrain_link).
+ 	void pollHpd() {
++		if (fDisplayVer < 14) return;
+ 		uint32_t live = rd(SDEISR) & kHpdPins;
+ 		if (live == fHpd) return;
+ 		FBLOG("hotplug: live ports 0x%08x -> 0x%08x (polled)", fHpd, live);
+@@ -903,7 +940,7 @@ private:
+ 		fHpd = live;
+ 		setProperty("IntelXeFBHotplugLive", live, 32);
+ 	}
+-	bool hpdPolling() const { return !fIrqOn || fHpdStormMask; }
++	bool hpdPolling() const { return fDisplayVer >= 14 && (!fIrqOn || fHpdStormMask); }
+ 	static void replugFire(thread_call_param_t p0, thread_call_param_t) {
+ 		IntelXeFramebuffer *me = (IntelXeFramebuffer *)p0;
+ 		if (me->fStopping || me->fDpmsDown) return;   // asleep with the output off: the wake modesets anyway
+@@ -975,6 +1012,7 @@ public:
+ 	// debug.intelxefb_mode: program a mode's plane and scaler without WindowServer (hardware test from a remote shell;
+ 	// WindowServer keeps drawing its own mode until it is told). setDisplayMode is the real path.
+ 	bool testMode(IODisplayModeID mode) {
++		if (fDisplayVer < 14 && mode != fMode) return false;
+ 		uint32_t w, h, vt;
+ 		if (!fRegs || fPipe < 0 || !modeSize(mode, &w, &h, &vt)) return false;
+ 		dispLock();
+@@ -999,6 +1037,7 @@ public:
+ 	}
+ 	int linkAction(int action) {
+ 		if (!fRegs || fPipe < 0) return -1;
++		if (fDisplayVer < 14) { FBLOG("link: C20 PHY link actions not supported on display %u", fDisplayVer); return -1; }
+ 		if (!fAux) { FBLOG("link: no AUX channel answered at start (no EDID), nothing to train over"); return -1; }
+ 		dispLock();
+ 		// the link actions take the transcoder down: VRR goes off first (as Linux disables it before a modeset) and
+@@ -1202,6 +1241,7 @@ public:
+ 		uint32_t w, h, vt, ext; uint64_t pclk;
+ 		if (depth != 0 || !modeLookup(mode, &w, &h, &vt, &pclk, &ext)) return kIOReturnUnsupported;
+ 		if (mode == fMode) return kIOReturnSuccess;
++		if (fDisplayVer < 14) return kIOReturnUnsupported;
+ 		// the cursor's coordinates come in the reported size (a HiDPI mode's scaled size); the plane runs the panel's
+ 		const uint32_t spaceW = w, spaceH = h;
+ 		if (progFind(mode)) { w = fWidth; h = fHeight; }   // accelerator backed: WindowServer scales on the GPU
+@@ -1448,12 +1488,14 @@ public:
+ 	// debug.intelxefb_hpd: 1 = a short pulse on the panel's pin, 2 = a long one, handled as if the sink had sent it
+ 	// (intel_hpd_trigger_irq); the interrupt itself is not involved. debug.intelxefb_hpdinfo: counters and the last result.
+ 	int hpdTrigger(int kind) {
++		if (fDisplayVer < 14) return ENOTSUP;
+ 		if (!fHpdPin || !fHpdCall || (kind != 1 && kind != 2)) return EINVAL;
+ 		OSBitOrAtomic(fHpdPin, kind == 2 ? &fHpdLong : &fHpdShort);
+ 		thread_call_enter(fHpdCall);
+ 		return 0;
+ 	}
+ 	int hpdInfo(char *b, int n) {
++		if (fDisplayVer < 14) return snprintf(b, (size_t)n, "HPD disabled on display %u (Milestone 2 GOP reuse)", fDisplayVer);
+ 		return snprintf(b, (size_t)n, "panel pin 0x%08x | interrupt %s (irq %d), storm-masked 0x%08x | interrupts %u: long %u short %u, "
+ 		                "storms %u | retrains %u failed %u (streak %u), sink IRQ vectors acked %u | SDEISR 0x%08x SDEIMR 0x%08x SDEIER 0x%08x "
+ 		                "SHOTPLUG_CTL_TC 0x%08x DDI 0x%08x SHPD_FILTER_CNT 0x%x (firmware 0x%x) | last: %s",
+@@ -1964,6 +2006,7 @@ IOReturn IntelXeFramebuffer::scanout(NMXScanout *r)
+ void IntelXeFramebuffer::vrrProbeCaps()
+ {
+ 	fVrrCapable = false;
++	if (fDisplayVer < 14) return;
+ 	if (!fEdidParse) { FBLOG("vrr: no EDID, not capable"); return; }
+ 	// drm_edid.c:6504 drm_get_monitor_range (v10m, fb/IntelXeEdid.cpp): EDID 1.4, continuous frequency, a range limits
+ 	// descriptor of the "range limits only" kind; min/max vertical rate with the 1.4 offset flags. v10l read the first
+@@ -1987,6 +2030,7 @@ void IntelXeFramebuffer::vrrProbeCaps()
+ // (the full vblank, intel_vrr_max_vblank_guardband; it keeps the vsync pulse inside the guardband for every mode).
+ bool IntelXeFramebuffer::vrrCompute(uint32_t vt)
+ {
++	if (fDisplayVer < 14) return false;
+ 	if (!fPclkCur || !fHT || !fVrrMinHz || !vt) return false;
+ 	const uint32_t hz = (uint32_t)(fPclkCur / ((uint64_t)fHT * vt));
+ 	if (hz + 1 < fVrrMinHz || hz > fVrrMaxHz + 1) { FBLOG("vrr: mode at %u Hz is outside the panel's %u-%u Hz", hz, fVrrMinHz, fVrrMaxHz); return false; }
+@@ -2008,6 +2052,7 @@ bool IntelXeFramebuffer::vrrCompute(uint32_t vt)
+ 
+ bool IntelXeFramebuffer::vrrEnableLocked()
+ {
++	if (fDisplayVer < 14) return false;
+ 	if (fVrrOn) return true;
+ 	if (!fVrrCapable || !fVrrAllowed || fPipe < 0 || !fRegs || !fFlipLock) return false;
+ 	const int t = fPipe;
+@@ -2055,7 +2100,7 @@ bool IntelXeFramebuffer::vrrEnableLocked()
+ 
+ void IntelXeFramebuffer::vrrDisableLocked(const char *why)
+ {
+-	if (fPipe < 0 || !fRegs || !fFlipLock) return;
++	if (fDisplayVer < 14 || fPipe < 0 || !fRegs || !fFlipLock) return;
+ 	const int t = fPipe;
+ 	if (!fVrrOn && !(rd(TRANS_VRR_CTL(t)) & VRR_CTL_VRR_ENABLE)) return;
+ 	// intel_vrr_tg_disable
+@@ -2089,6 +2134,7 @@ void IntelXeFramebuffer::vrrDisableLocked(const char *why)
+ 
+ int IntelXeFramebuffer::vrrSet(int on)
+ {
++	if (fDisplayVer < 14) return ENOTSUP;
+ 	if (!fRegs || fPipe < 0) return ENODEV;
+ 	if (on == 1 && !fVrrAllowed) return EPERM;
+ 	if (on == 1 && !fVrrCapable) return ENOTSUP;
+@@ -2218,19 +2264,21 @@ void IntelXeFramebuffer::irqHandle(uint32_t master)
+ 		const uint32_t sde = rd(SDEIIR);
+ 		if (sde) {
+ 			wr(SDEIIR, sde);
+-			const uint32_t tcTrig = sde & SDE_TC_HOTPLUG_MASK, ddiTrig = sde & SDE_DDI_HOTPLUG_MASK;
+-			uint32_t longs = 0;
+-			if (tcTrig) {
+-				const uint32_t v = rd(SHOTPLUG_CTL_TC);
+-				wr(SHOTPLUG_CTL_TC, v);
+-				for (int i = 0; i < 4; i++) if ((tcTrig & (1u << (24 + i))) && (v >> (4 * i)) & HPD_LONG) longs |= 1u << (24 + i);
+-			}
+-			if (ddiTrig) {
+-				const uint32_t v = rd(SHOTPLUG_CTL_DDI);
+-				wr(SHOTPLUG_CTL_DDI, v);
+-				for (int i = 0; i < 2; i++) if ((ddiTrig & (1u << (16 + i))) && (v >> (4 * i)) & HPD_LONG) longs |= 1u << (16 + i);
++			if (fDisplayVer >= 14) {
++				const uint32_t tcTrig = sde & SDE_TC_HOTPLUG_MASK, ddiTrig = sde & SDE_DDI_HOTPLUG_MASK;
++				uint32_t longs = 0;
++				if (tcTrig) {
++					const uint32_t v = rd(SHOTPLUG_CTL_TC);
++					wr(SHOTPLUG_CTL_TC, v);
++					for (int i = 0; i < 4; i++) if ((tcTrig & (1u << (24 + i))) && (v >> (4 * i)) & HPD_LONG) longs |= 1u << (24 + i);
++				}
++				if (ddiTrig) {
++					const uint32_t v = rd(SHOTPLUG_CTL_DDI);
++					wr(SHOTPLUG_CTL_DDI, v);
++					for (int i = 0; i < 2; i++) if ((ddiTrig & (1u << (16 + i))) && (v >> (4 * i)) & HPD_LONG) longs |= 1u << (16 + i);
++				}
++				if (tcTrig | ddiTrig) { fIrqHpd++; hpdIrq(tcTrig | ddiTrig, longs); }
+ 			}
+-			if (tcTrig | ddiTrig) { fIrqHpd++; hpdIrq(tcTrig | ddiTrig, longs); }
+ 		}
+ 	}
+ 	if (ctl & DE_MISC_IRQ) { const uint32_t v = rd(DE_MISC_IIR); if (v) wr(DE_MISC_IIR, v); }
+@@ -2246,6 +2294,7 @@ void IntelXeFramebuffer::irqHandle(uint32_t master)
+ // hpdReenable, intel_hpd_irq_storm_switch_to_polling / _reenable_work), then the pulses go to hpdWork (dig_port_work).
+ void IntelXeFramebuffer::hpdIrq(uint32_t pins, uint32_t longs)
+ {
++	if (fDisplayVer < 14) return;
+ 	const uint64_t now = mach_absolute_time();
+ 	uint64_t period; nanoseconds_to_absolutetime((uint64_t)kHpdStormPeriodMs * 1000000ull, &period);
+ 	uint32_t storm = 0;
+@@ -2276,7 +2325,7 @@ void IntelXeFramebuffer::hpdIrq(uint32_t pins, uint32_t longs)
+ 
+ void IntelXeFramebuffer::hpdReenable()
+ {
+-	if (fStopping) return;
++	if (fStopping || fDisplayVer < 14) return;
+ 	uint32_t was = 0;
+ 	if (fHpdImrLock) IOSimpleLockLock(fHpdImrLock);
+ 	was = fHpdStormMask;
+@@ -2354,7 +2403,7 @@ void IntelXeFramebuffer::hpdShortPulse()
+ // intel_dp_check_link_state). Long pulse with the port down: unplugged, logged; its return is the next long pulse.
+ void IntelXeFramebuffer::hpdWork()
+ {
+-	if (fStopping) return;
++	if (fStopping || fDisplayVer < 14) return;
+ 	const uint32_t longs = __atomic_exchange_n(&fHpdLong, 0u, __ATOMIC_ACQ_REL);
+ 	const uint32_t shorts = __atomic_exchange_n(&fHpdShort, 0u, __ATOMIC_ACQ_REL) & ~longs;   // a long pulse covers it
+ 	if (!(longs | shorts)) return;
+@@ -2407,46 +2456,53 @@ bool IntelXeFramebuffer::irqRegister(bool on)
+ 		wr(DE_PIPE_IER(p), rd(DE_PIPE_IER(p)) | PIPE_VBLANK | PIPE_FIFO_UNDERRUN);
+ 		wr(DE_PIPE_IMR(p), rd(DE_PIPE_IMR(p)) & ~(PIPE_VBLANK | PIPE_FIFO_UNDERRUN));
+ 		uint32_t tc = 0;
+-		uint32_t hctl = rd(SHOTPLUG_CTL_TC), dctl = rd(SHOTPLUG_CTL_DDI);
+-		if (!fHpdEnSaved) {   // the firmware's choice of pins, kept for every later registration (the wakes)
+-			fHpdEnTc = hctl & 0x8888u; fHpdEnDdi = dctl & 0x88u; fSouthChicken1Boot = rd(SOUTH_CHICKEN1); fHpdEnSaved = true;
+-		} else {
+-			if ((hctl & 0x8888u) != fHpdEnTc || (dctl & 0x88u) != fHpdEnDdi)
+-				FBLOG("hotplug: detection enables TC 0x%04x DDI 0x%02x (firmware's TC 0x%04x DDI 0x%02x, cleared by system sleep): set "
+-				      "again (mtp_ddi/tc_hpd_detection_setup)", hctl & 0x8888u, dctl & 0x88u, fHpdEnTc, fHpdEnDdi);
+-			const uint32_t sc = rd(SOUTH_CHICKEN1);
+-			if (sc != fSouthChicken1Boot) {   // HPD inversion lives here (mtp_hpd_invert): back to what the firmware had
+-				FBLOG("hotplug: SOUTH_CHICKEN1 0x%08x, firmware's 0x%08x: put back", sc, fSouthChicken1Boot);
+-				wr(SOUTH_CHICKEN1, fSouthChicken1Boot);
++		if (fDisplayVer >= 14) {
++			uint32_t hctl = rd(SHOTPLUG_CTL_TC), dctl = rd(SHOTPLUG_CTL_DDI);
++			if (!fHpdEnSaved) {   // the firmware's choice of pins, kept for every later registration (the wakes)
++				fHpdEnTc = hctl & 0x8888u; fHpdEnDdi = dctl & 0x88u; fSouthChicken1Boot = rd(SOUTH_CHICKEN1); fHpdEnSaved = true;
++			} else {
++				if ((hctl & 0x8888u) != fHpdEnTc || (dctl & 0x88u) != fHpdEnDdi)
++					FBLOG("hotplug: detection enables TC 0x%04x DDI 0x%02x (firmware's TC 0x%04x DDI 0x%02x, cleared by system sleep): set "
++					      "again (mtp_ddi/tc_hpd_detection_setup)", hctl & 0x8888u, dctl & 0x88u, fHpdEnTc, fHpdEnDdi);
++				const uint32_t sc = rd(SOUTH_CHICKEN1);
++				if (sc != fSouthChicken1Boot) {   // HPD inversion lives here (mtp_hpd_invert): back to what the firmware had
++					FBLOG("hotplug: SOUTH_CHICKEN1 0x%08x, firmware's 0x%08x: put back", sc, fSouthChicken1Boot);
++					wr(SOUTH_CHICKEN1, fSouthChicken1Boot);
++				}
+ 			}
++			hctl |= fHpdEnTc; dctl |= fHpdEnDdi;
++			for (int pin = 0; pin < 4; pin++) if (hctl & (0x8u << (4 * pin))) tc |= 1u << (24 + pin);   // TC1-4 detection enabled
++			// mtp_hpd_irq_setup: the 250 us HPD filter (the firmware leaves a longer one, which can swallow a short pulse),
++			// then the detection enables (writing the sticky pulse status back clears it) and SDEIIR cleared before the
++			// pins are unmasked
++			if (fShpdFilterBoot == ~0u) fShpdFilterBoot = rd(SHPD_FILTER_CNT);
++			wr(SHPD_FILTER_CNT, SHPD_FILTER_CNT_250);
++			wr(SHOTPLUG_CTL_TC, hctl);
++			wr(SHOTPLUG_CTL_DDI, dctl);
++			wr(SDEIIR, rd(SDEIIR) & (tc | SDE_DDI_HOTPLUG_MASK));
++			wr(SDEIER, rd(SDEIER) | tc);
++			if (fHpdImrLock) IOSimpleLockLock(fHpdImrLock);
++			wr(SDEIMR, rd(SDEIMR) & ~(tc & ~fHpdStormMask));
++			if (fHpdImrLock) IOSimpleLockUnlock(fHpdImrLock);
+ 		}
+-		hctl |= fHpdEnTc; dctl |= fHpdEnDdi;
+-		for (int pin = 0; pin < 4; pin++) if (hctl & (0x8u << (4 * pin))) tc |= 1u << (24 + pin);   // TC1-4 detection enabled
+-		// mtp_hpd_irq_setup: the 250 us HPD filter (the firmware leaves a longer one, which can swallow a short pulse),
+-		// then the detection enables (writing the sticky pulse status back clears it) and SDEIIR cleared before the
+-		// pins are unmasked
+-		if (fShpdFilterBoot == ~0u) fShpdFilterBoot = rd(SHPD_FILTER_CNT);
+-		wr(SHPD_FILTER_CNT, SHPD_FILTER_CNT_250);
+-		wr(SHOTPLUG_CTL_TC, hctl);
+-		wr(SHOTPLUG_CTL_DDI, dctl);
+-		wr(SDEIIR, rd(SDEIIR) & (tc | SDE_DDI_HOTPLUG_MASK));
+-		wr(SDEIER, rd(SDEIER) | tc);
+-		if (fHpdImrLock) IOSimpleLockLock(fHpdImrLock);
+-		wr(SDEIMR, rd(SDEIMR) & ~(tc & ~fHpdStormMask));
+-		if (fHpdImrLock) IOSimpleLockUnlock(fHpdImrLock);
+ 		fIrqVblLast = fIrqVbl; fIrqMiss = 0;
+ 		fIrqOn = true;
+ 		wr(GEN11_DISPLAY_INT_CTL, DISPLAY_IRQ_ENABLE);
+-		FBLOG("display irq: vblank (pipe %c) and hotplug (SDE 0x%08x, panel pin 0x%08x, filter 0x%x -> 0x%x) interrupts on",
+-		      'A' + p, tc, fHpdPin, fShpdFilterBoot, SHPD_FILTER_CNT_250);
++		if (fDisplayVer >= 14)
++			FBLOG("display irq: vblank (pipe %c) and hotplug (SDE 0x%08x, panel pin 0x%08x, filter 0x%x -> 0x%x) interrupts on",
++			      'A' + p, tc, fHpdPin, fShpdFilterBoot, SHPD_FILTER_CNT_250);
++		else
++			FBLOG("display irq: vblank (pipe %c) interrupts on (HPD off on display %u)", 'A' + p, fDisplayVer);
+ 		return true;
+ 	}
+ 	fIrqOn = false;
+ 	wr(GEN11_DISPLAY_INT_CTL, 0);
+ 	wr(DE_PIPE_IMR(p), rd(DE_PIPE_IMR(p)) | PIPE_FIFO_UNDERRUN);   // as the firmware left it: vblank unmasked, nothing enabled
+ 	wr(DE_PIPE_IER(p), rd(DE_PIPE_IER(p)) & ~(PIPE_VBLANK | PIPE_FIFO_UNDERRUN));
+-	wr(SDEIER, rd(SDEIER) & ~SDE_TC_HOTPLUG_MASK);
+-	wr(SDEIMR, rd(SDEIMR) | SDE_TC_HOTPLUG_MASK);
++	if (fDisplayVer >= 14) {
++		wr(SDEIER, rd(SDEIER) & ~SDE_TC_HOTPLUG_MASK);
++		wr(SDEIMR, rd(SDEIMR) | SDE_TC_HOTPLUG_MASK);
++	}
+ 	if (fIntelXe && sym) (void)fIntelXe->callPlatformFunction(sym, false, &r, nullptr, nullptr, nullptr);   // none in flight after this
+ 	if (sym) sym->release();
+ 	FBLOG("display irq: off (%u vblank, %u hotplug, %u underrun interrupts)", fIrqVbl, fIrqHpd, fIrqUnderruns);
+@@ -2536,6 +2592,12 @@ int IntelXeFramebuffer::vrrInfo(char *b, int n)
+ {
+ 	const int t = fPipe;
+ 	if (t < 0 || !fRegs) return snprintf(b, (size_t)n, "no pipe");
++	if (fDisplayVer < 14) {
++		return snprintf(b, (size_t)n, "display %u: VRR disabled | sleep %u resume %u failed %u | irq %d calls %u vblank %u underrun %u | "
++		                "cursor ready %d image %d visible %d %ux%u images %u moves %u CURCNTR 0x%08x CURPOS 0x%08x",
++		                fDisplayVer, fSuspends, fResumes, fResumeFails, (int)fIrqOn, fIrqCalls, fIrqVbl, fIrqUnderruns,
++		                fCurReady, fCurHave, fCurVisible, fCurSrcW, fCurSrcH, fCurImages, fCurMoves, rd(CURCNTR(t)), rd(CURPOS(t)));
++	}
+ 	uint8_t ds = 0xFF; (void)dpcd(DP_DOWNSPREAD_CTRL, &ds, 1, false);
+ 	return snprintf(b, (size_t)n, "allowed %d capable %d on %d range %u-%u Hz vmin %u vmax %u guardband %u (%u-%u us) vbl %u tick %u lfc %d | "
+ 	                "VRR_CTL 0x%08x VMIN %u VMAX %u FLIPLINE %u STATUS 0x%08x STATUS2 %u VTOTAL_PREV 0x%08x PUSH 0x%08x VSYNC 0x%08x SDP_TL 0x%08x "
+@@ -2574,6 +2636,11 @@ bool IntelXeFramebuffer::cursorInit()
+ 	fCurSrc = (uint32_t *)IOMalloc(kCurBytes);
+ 	const bool own = cursorBufferAlloc(&fCurDpa, &fCurBo, &fCurMap);
+ 	if (!own) {
++		const uint64_t surfLen = (uint64_t)fRowBytes * fHeight;
++		if (kCurDpa < fDpa + surfLen && kCurDpa + kCurBytes > fDpa) {
++			FBLOG("cursor: fallback VRAM 0x%llx overlaps GOP surface 0x%llx..0x%llx", kCurDpa, fDpa, fDpa + surfLen - 1);
++			return false;
++		}
+ 		fCurDpa = kCurDpa;
+ 		if (IODeviceMemory *m = IODeviceMemory::withRange(fBarBase + kCurDpa, kCurBytes)) { fCurMap = m->map(kIOMapWriteCombineCache); m->release(); }
+ 	}
+@@ -2778,6 +2845,7 @@ IOReturn IntelXeFramebuffer::setCursorState(SInt32 x, SInt32 y, bool visible)
+ // (validateDetailedTiming) and enables VRR when such a timing is set (hwSetMode -> hwEnableVRR); this does the same.
+ const char *IntelXeFramebuffer::progCheck(const IODetailedTimingInformationV2 &t) const
+ {
++	if (fDisplayVer < 14) return "modeset not supported on DG2";
+ 	if (t.horizontalActive != fWidth || t.verticalActive != fHeight) return "active size";
+ 	if (t.horizontalActive + t.horizontalBlanking != fHT) return "horizontal total";
+ 	// syncs: the firmware's stay on the pipe (nothing reprograms them); a timing that names others (DisplayID's
+@@ -2825,7 +2893,7 @@ const char *IntelXeFramebuffer::progCheck(const IODetailedTimingInformationV2 &t
+ void IntelXeFramebuffer::publishScalerInfo()
+ {
+ 	fScalerPublished = false;
+-	if (!gHidpi) { removeProperty(kIOFBScalerInfoKey); return; }   // opt-in: intelxefb-hidpi=1
++	if (fDisplayVer < 14 || !gHidpi) { removeProperty(kIOFBScalerInfoKey); return; }   // opt-in: intelxefb-hidpi=1
+ 	if (!fScaling || fHomeOwned < 0 || !fCdclkKhz) { removeProperty(kIOFBScalerInfoKey); FBLOG("scaler: no HiDPI modes (scaling %d, home %d, cdclk %u)", (int)fScaling, fHomeOwned, fCdclkKhz); return; }
+ 	IODisplayScalerInformation si; bzero(&si, sizeof si);
+ 	si.scalerFeatures = kIOScaleCanDownSamplePixels;
+@@ -2975,7 +3043,7 @@ void IntelXeFramebuffer::applyVrrLocked(const char *why)
+ 
+ void IntelXeFramebuffer::publishTimingRange(bool on)
+ {
+-	if (!on || fPipe < 0 || !fPclk) { removeProperty(kIOFBTimingRangeKey); fRangePublished = false; return; }
++	if (fDisplayVer < 14 || !on || fPipe < 0 || !fPclk) { removeProperty(kIOFBTimingRangeKey); fRangePublished = false; return; }
+ 	IODisplayTimingRangeV2 r; bzero(&r, sizeof r);
+ 	r.version = kIOTimingRangeV2;
+ 	// EDID timings carry 10 kHz steps: 0.5 % headroom (as progCheck allows) so the firmware's own timing, rounded up to
+@@ -3030,7 +3098,7 @@ void IntelXeFramebuffer::publishTimingRange(bool on)
+ static void edidSum(uint8_t *blk) { uint8_t s = 0; for (int i = 0; i < 127; i++) s = (uint8_t)(s + blk[i]); blk[127] = (uint8_t)(0x100 - s); }
+ void IntelXeFramebuffer::vrrModesInit()
+ {
+-	if (!gVrrModes) return;
++	if (fDisplayVer < 14 || !gVrrModes) return;
+ 	char dummy[8];
+ 	if (fEdidLen >= 256 && fEdidLen + 128 <= kEdidMax && !intelxeBootArg("IntelXeFB", "-intelxefb_noedidfix", dummy, sizeof dummy)) {
+ 		const uint8_t *b = fEdid + 54;
+@@ -3173,22 +3241,22 @@ void IntelXeFramebuffer::vrrModesInit()
+ // then plane 1's DDB and watermarks. Saved before sleep, written back in this order after a wake that lost them
+ // (the GOP's values: no DMC here, DC states stay off). Pipe-relative entries are marked with bit 0 of the flags.
+ namespace {
+-struct CoreReg { uint32_t off; uint8_t pipe, wait; };   // wait: 1 power well pairs (state = request >> 1), 2 PLL lock, 3 DBUF state, 4 PMDEMAND
++struct CoreReg { uint32_t off; uint8_t pipe, wait, minVer; };   // wait: 1 power well pairs (state = request >> 1), 2 PLL lock, 3 DBUF state, 4 PMDEMAND
+ const CoreReg kCoreRegs[] = {
+-	{ 0x45504, 0, 0 },   // DC_STATE_EN
+-	{ 0x46408, 0, 0 },   // HSW_NDE_RSTWRN_OPT (PCH reset handshake)
+-	{ 0x45400, 0, 1 }, { 0x45404, 0, 1 },   // HSW_PWR_WELL_CTL1 (BIOS) / CTL2 (driver)
+-	{ 0x46070, 0, 2 },   // BXT_DE_PLL_ENABLE: CDCLK PLL ratio + enable
+-	{ 0x46008, 0, 0 }, { 0x46000, 0, 0 },   // CDCLK_SQUASH_CTL, CDCLK_CTL
+-	{ 0x45230, 0, 0 }, { 0x45234, 0, 4 },   // PMDEMAND request dwords (REQ_ENABLE on the second)
+-	{ 0x45008, 0, 3 }, { 0x44FE8, 0, 3 }, { 0x44300, 0, 3 }, { 0x44304, 0, 3 },   // DBUF_CTL_S0-3
+-	{ 0x45038, 0, 0 }, { 0x45048, 0, 0 }, { 0x4504C, 0, 0 }, { 0x4438C, 0, 0 },   // MBUS_ABOX0-2_CTL, MBUS_CTL
+-	{ 0x7003C, 1, 0 },   // PIPE_MBUS_DBOX_CTL
+-	{ 0x45130, 0, 0 }, { 0x45134, 0, 0 }, { 0x45140, 0, 0 }, { 0x45144, 0, 0 },   // BW_BUDDY0/1 CTL, PAGE_MASK
+-	{ 0x42084, 0, 0 },   // CHICKEN_MISC_2 (BMG_DARB_HALF_BLK_END_BURST)
+-	{ 0x7027C, 1, 0 },   // PLANE_BUF_CFG_1 (DDB)
+-	{ 0x70240, 1, 0 }, { 0x70244, 1, 0 }, { 0x70248, 1, 0 }, { 0x7024C, 1, 0 }, { 0x70250, 1, 0 }, { 0x70254, 1, 0 },
+-	{ 0x70258, 1, 0 }, { 0x7025C, 1, 0 }, { 0x70268, 1, 0 },   // PLANE_WM_1 levels 0-5, SAGV, SAGV_TRANS, TRANS
++	{ 0x45504, 0, 0, 13 },   // DC_STATE_EN
++	{ 0x46408, 0, 0, 13 },   // HSW_NDE_RSTWRN_OPT (PCH reset handshake)
++	{ 0x45400, 0, 1, 13 }, { 0x45404, 0, 1, 13 },   // HSW_PWR_WELL_CTL1 (BIOS) / CTL2 (driver)
++	{ 0x46070, 0, 2, 13 },   // BXT_DE_PLL_ENABLE: CDCLK PLL ratio + enable
++	{ 0x46008, 0, 0, 13 }, { 0x46000, 0, 0, 13 },   // CDCLK_SQUASH_CTL, CDCLK_CTL
++	{ 0x45230, 0, 0, 14 }, { 0x45234, 0, 4, 14 },   // PMDEMAND request dwords (Display 14+ only)
++	{ 0x45008, 0, 3, 13 }, { 0x44FE8, 0, 3, 13 }, { 0x44300, 0, 3, 14 }, { 0x44304, 0, 3, 14 },   // DBUF_CTL_S0-1 (DG2), S2-3 (Display 14+)
++	{ 0x45038, 0, 0, 13 }, { 0x45048, 0, 0, 13 }, { 0x4504C, 0, 0, 13 }, { 0x4438C, 0, 0, 13 },   // MBUS_ABOX0-2_CTL, MBUS_CTL
++	{ 0x7003C, 1, 0, 13 },   // PIPE_MBUS_DBOX_CTL
++	{ 0x45130, 0, 0, 13 }, { 0x45134, 0, 0, 13 }, { 0x45140, 0, 0, 13 }, { 0x45144, 0, 0, 13 },   // BW_BUDDY0/1 CTL, PAGE_MASK
++	{ 0x42084, 0, 0, 14 },   // CHICKEN_MISC_2 (BMG_DARB_HALF_BLK_END_BURST, Display 14+ only)
++	{ 0x7027C, 1, 0, 13 },   // PLANE_BUF_CFG_1 (DDB)
++	{ 0x70240, 1, 0, 13 }, { 0x70244, 1, 0, 13 }, { 0x70248, 1, 0, 13 }, { 0x7024C, 1, 0, 13 }, { 0x70250, 1, 0, 13 }, { 0x70254, 1, 0, 13 },
++	{ 0x70258, 1, 0, 13 }, { 0x7025C, 1, 0, 13 }, { 0x70268, 1, 0, 13 },   // PLANE_WM_1 levels 0-5, SAGV, SAGV_TRANS, TRANS
+ };
+ constexpr int kNumCoreRegs = (int)(sizeof kCoreRegs / sizeof kCoreRegs[0]);
+ static_assert(kNumCoreRegs <= 48, "core register table");
+@@ -3198,6 +3266,7 @@ void IntelXeFramebuffer::coreSaveRestore(bool restore)
+ {
+ 	if (fPipe < 0 || !fRegs) return;
+ 	for (int i = 0; i < kNumCoreRegs; i++) {
++		if (fDisplayVer < kCoreRegs[i].minVer) continue;
+ 		const uint32_t off = kCoreRegs[i].off + (kCoreRegs[i].pipe ? (uint32_t)fPipe * 0x1000u : 0u);
+ 		if (!restore) { fCoreSaved[i] = rd(off); continue; }
+ 		const uint32_t v = fCoreSaved[i];
+@@ -3291,6 +3360,10 @@ void IntelXeFramebuffer::powerEvent(uint32_t event)
+ 		}
+ 		coreSaveRestore(false);
+ 		pipeColorSave();
++		if (fDisplayVer < 14) {
++			FBLOG("system sleep: display %u core/color state saved (C20 link power-down skipped)", fDisplayVer);
++			return;
++		}
+ 		const int s = linkAction(IntelXeLink::kSave);
+ 		const int d = linkAction(IntelXeLink::kPowerDown);   // sink to D3 and the output off cleanly, as Linux's suspend
+ 		FBLOG("system sleep: display state saved (%d), output %s (%d)", s, d ? "NOT powered down" : "powered down", d);
+@@ -3325,10 +3398,16 @@ void IntelXeFramebuffer::resumeDisplay()
+ 	dispLock();
+ 	planeNoarm(fPipe);
+ 	dispUnlock();
+-	int r = linkAction(IntelXeLink::kRestore);
+-	if (r) { FBLOG("resume: restore modeset failed (%d), once more", r); IOSleep(200); r = linkAction(IntelXeLink::kRestore); }
+-	if (r) fResumeFails++;
+-	else fDpmsDown = false;                          // the restore modeset also brought a DPMS-off output back
++	int r = 0;
++	if (fDisplayVer >= 14) {
++		r = linkAction(IntelXeLink::kRestore);
++		if (r) { FBLOG("resume: restore modeset failed (%d), once more", r); IOSleep(200); r = linkAction(IntelXeLink::kRestore); }
++		if (r) fResumeFails++;
++		else fDpmsDown = false;                      // the restore modeset also brought a DPMS-off output back
++	} else {
++		fDpmsDown = false;
++		if (coreLost) FBLOG("resume: display %u core lost power (SNPS PHY restore deferred to Milestone 3)", fDisplayVer);
++	}
+ 	dispLock();
+ 	// plane registers, scaler, surface home; the plane's enable stays as display sleep left it (blank(false) on the
+ 	// display's own wake turns it on)
+@@ -3368,6 +3447,11 @@ IOService *IntelXeFramebuffer::probe(IOService *provider, SInt32 *score)
+ 	if (!pci) return nullptr;
+ 	if (bootArg("-intelxe_nofb") || bootArg("-intelxefb_off")) { FBLOG("off by boot-arg"); return nullptr; }
+ 	if (bootArg("-x")) { FBLOG("safe mode: not starting"); return nullptr; }
++	const uint16_t devId = pci->configRead16(kIOPCIConfigDeviceID);
++	if (isDg2DeviceId(devId) && !bootArg("-intelxe_allow_dg2_fb")) {
++		FBLOG("8086:%04x is DG2: framebuffer disabled (pass -intelxe_allow_dg2_fb to test)", devId);
++		return nullptr;
++	}
+ 	return IOFramebuffer::probe(provider, score);
+ }
+ 
+@@ -3541,13 +3625,15 @@ bool IntelXeFramebuffer::adoptFirmwareMode(IOPhysicalAddress barBase, IOPhysical
+ 				return false;
+ 			}
+ 		}
+-		if (fDpa + len > barLen) {
+-			FBLOG("pipe %c: surface at VRAM 0x%llx is past the %llu MiB BAR2 window", 'A' + p, fDpa, (unsigned long long)(barLen >> 20));
++		if (!len || len > (uint64_t)barLen || fDpa > (uint64_t)barLen - len) {
++			FBLOG("pipe %c: surface at VRAM 0x%llx (%llu bytes) is past the %llu MiB BAR2 window", 'A' + p, fDpa,
++			      (unsigned long long)len, (unsigned long long)(barLen >> 20));
+ 			return false;
+ 		}
+ 		fSurfPhys = barBase + fDpa;
+ 		fBarBase = barBase; fBarLen = barLen;
+ 		fPteFlags = first & ~kPteAddr;
++		if (fDisplayVer < 14) fPteFlags &= ~(1ull << 53);   // DG2 GGTT PTEs do not use Xe2's PAT bit 53
+ 		fHT = (rd(HTOTAL(p)) >> 16) + 1; fVT = (rd(VTOTAL(p)) >> 16) + 1; fModeVT = fVT;
+ 		fHSS = (rd(HSYNC(p)) & 0xFFFF) + 1; fHSE = (rd(HSYNC(p)) >> 16) + 1;
+ 		fVSS = (rd(VSYNC(p)) & 0xFFFF) + 1; fVSE = (rd(VSYNC(p)) >> 16) + 1;
+@@ -3591,7 +3677,7 @@ bool IntelXeFramebuffer::adoptFirmwareMode(IOPhysicalAddress barBase, IOPhysical
+ 		      fRefresh16 >> 16, ((fRefresh16 & 0xFFFF) * 100) >> 16);
+ 		return true;
+ 	}
+-	FBLOG("no pipe is scanning out (no monitor on the B580 at boot?)");
++	FBLOG("no pipe is scanning out (no monitor lit by UEFI GOP at boot?)");
+ 	return false;
+ }
+ 
+@@ -3599,6 +3685,11 @@ bool IntelXeFramebuffer::start(IOService *provider)
+ {
+ 	fPCI = OSDynamicCast(IOPCIDevice, provider);
+ 	if (!fPCI) return false;
++	const uint16_t devId = fPCI->configRead16(kIOPCIConfigDeviceID);
++	if (isDg2DeviceId(devId) && !bootArg("-intelxe_allow_dg2_fb")) {
++		FBLOG("8086:%04x is DG2: framebuffer disabled (pass -intelxe_allow_dg2_fb to test)", devId);
++		return false;
++	}
+ 	char dummy[8];
+ 	if (intelxeBootArg("IntelXeFB", "-intelxefb_noscale", dummy, sizeof(dummy))) { fScaling = false; FBLOG("scaled modes off by boot-arg"); }
+ 	if (intelxeBootArg("IntelXeFB", "-intelxefb_norates", dummy, sizeof(dummy))) { fRates = false; FBLOG("other refresh rates off by boot-arg"); }
+@@ -3618,9 +3709,72 @@ bool IntelXeFramebuffer::start(IOService *provider)
+ 	fPCI->setMemoryEnable(true);
+ 	fMMIO = fPCI->mapDeviceMemoryWithRegister(kIOPCIConfigBaseAddress0);
+ 	IODeviceMemory *ap = fPCI->getDeviceMemoryWithRegister(kIOPCIConfigBaseAddress2);
+-	if (!fMMIO || !ap || fMMIO->getLength() < kGsm + 0x800000) { FBLOG("BAR0 or BAR2 is not available"); OSSafeReleaseNULL(fMMIO); return false; }
++	if (!fMMIO || !ap || fMMIO->getLength() < kGsm + 0x800000 || !ap->getLength()) {
++		FBLOG("BAR0 or BAR2 is not available");
++		OSSafeReleaseNULL(fMMIO);
++		return false;
++	}
+ 	fRegs = (volatile uint8_t *)fMMIO->getVirtualAddress();
+-	if (!adoptFirmwareMode(ap->getPhysicalAddress(), ap->getLength())) { OSSafeReleaseNULL(fMMIO); fRegs = nullptr; return false; }
++	if (rd(0) == 0xFFFFFFFFu) {
++		FBLOG("BAR0 MMIO reads 0xffffffff: aborting cleanly before display init");
++		OSSafeReleaseNULL(fMMIO); fRegs = nullptr;
++		return false;
++	}
++	IntelXeDeviceInfo info = {};
++	info.version = 1;
++	IOReturn infoRr = kIOReturnUnsupported;
++	if (IOService *xe = intelxe()) {
++		if (const OSSymbol *sym = OSSymbol::withCString("intelxeGetDeviceInfo")) {
++			infoRr = xe->callPlatformFunction(sym, false, &info, nullptr, nullptr, nullptr);
++			sym->release();
++		}
++	}
++	if (infoRr == kIOReturnSuccess) {
++		fIsDg2 = (info.platform == kXePlatformDg2) || isDg2DeviceId(info.deviceId);
++		fDisplayVer = info.displayVer ? info.displayVer : (fIsDg2 ? 13 : 14);
++		fBar2Mapped = info.bar2Mapped != 0;
++		if (!info.hasDisplay) {
++			FBLOG("8086:%04x has no display engine: aborting", info.deviceId);
++			OSSafeReleaseNULL(fMMIO); OSSafeReleaseNULL(fIntelXe); fRegs = nullptr;
++			return false;
++		}
++		if (fIsDg2 && !fBar2Mapped) {
++			FBLOG("DG2 8086:%04x: BAR2 not mapped in IntelXe (Small-BAR / ResizeAppleGpuBars=-1): aborting to keep UEFI GOP console", info.deviceId);
++			OSSafeReleaseNULL(fMMIO); OSSafeReleaseNULL(fIntelXe); fRegs = nullptr;
++			return false;
++		}
++	} else {
++		fIsDg2 = isDg2DeviceId(devId);
++		fDisplayVer = fIsDg2 ? 13 : 14;
++		fBar2Mapped = true;
++	}
++	if (fDisplayVer < 14) {
++		fScaling = false; fRates = false; fCommonRates = false;
++		fVrrAllowed = false; fPipeBAllowed = false;
++		gVrrModes = 0; gHidpi = 0; gDpms = 0;
++	}
++	if (!adoptFirmwareMode(ap->getPhysicalAddress(), ap->getLength())) {
++		OSSafeReleaseNULL(fMMIO); OSSafeReleaseNULL(fIntelXe); fRegs = nullptr;
++		return false;
++	}
++	if (IODeviceMemory *sm = IODeviceMemory::withRange(fSurfPhys, (IOPhysicalLength)fRowBytes * fHeight)) {
++		fSurfMap = sm->map(kIOMapWriteCombineCache); sm->release();
++	}
++	if (!fSurfMap) {
++		FBLOG("surface at phys 0x%llx (%ux%u) failed write-combined BAR2 mapping: aborting to keep UEFI GOP console",
++		      (unsigned long long)fSurfPhys, fWidth, fHeight);
++		OSSafeReleaseNULL(fMMIO); OSSafeReleaseNULL(fIntelXe); fRegs = nullptr;
++		return false;
++	}
++	if (fDisplayVer < 14) {
++		const uint32_t dc = rd(DC_STATE_EN);
++		if (dc) {
++			FBLOG("DG2: clearing DC_STATE_EN 0x%08x -> 0 (DMC deferred, static power wells)", dc);
++			wr(DC_STATE_EN, 0);
++		}
++		FBLOG("DG2: display %u GOP adopted (pipe %c, PWR_WELL_CTL1 0x%08x CTL2 0x%08x AUX2 0x%08x)",
++		      fDisplayVer, 'A' + fPipe, rd(HSW_PWR_WELL_CTL1), rd(HSW_PWR_WELL_CTL2), rd(ICL_PWR_WELL_CTL_AUX2));
++	}
+ 	guardBegin();   // before anything that could take the machine down; published before the framebuffer is
+ 	probeEdid();
+ 	parseEdid();
+@@ -3665,12 +3819,12 @@ bool IntelXeFramebuffer::start(IOService *provider)
+ 		};
+ 		long v = 0;
+ 		if (nvNum("intelxefb-hwcursor", 0, 1, &v)) gHwCursor = (int)v;
+-		if (nvNum("intelxefb-dpms", 0, 1, &v)) gDpms = (int)v;
++		if (fDisplayVer >= 14 && nvNum("intelxefb-dpms", 0, 1, &v)) gDpms = (int)v;
+ 		if (nvNum("intelxefb-vrr-lfc", 0, 1, &v)) gVrrLfc = (int)v;
+ 		if (nvNum("intelxefb-vrr-floor", 0, 500, &v)) gVrrFloorHz = (uint32_t)v;
+ 	}
+ 	cursorInit();
+-	{
++	if (fDisplayVer >= 14) {
+ 		// macOS Adaptive-Sync modes, on unless boot-arg intelxefb_vrrmodes=0 or NVRAM intelxefb-vrr-modes=0 (the EDID change needs it at start)
+ 		int v = 0;
+ 		if (intelxeBootArg("IntelXeFB", "intelxefb_vrrmodes", &v, sizeof v)) gVrrModes = v;
+@@ -3701,7 +3855,8 @@ bool IntelXeFramebuffer::start(IOService *provider)
+ 	if (!IOFramebuffer::start(provider)) {
+ 		guardAbandon(); fGuardStage = 0;
+ 		if (fGuardCall) { thread_call_cancel(fGuardCall); while (!thread_call_free(fGuardCall)) { thread_call_cancel(fGuardCall); IOSleep(5); } fGuardCall = nullptr; }
+-		OSSafeReleaseNULL(fMMIO); fRegs = nullptr;
++		OSSafeReleaseNULL(fSurfMap); OSSafeReleaseNULL(fMMIO); fRegs = nullptr;
++		ggttRelease(); OSSafeReleaseNULL(fIntelXe);
+ 		if (fDispLock) { IOLockFree(fDispLock); fDispLock = nullptr; }
+ 		if (fFlipLock) { IOSimpleLockFree(fFlipLock); fFlipLock = nullptr; }
+ 		if (fHpdImrLock) { IOSimpleLockFree(fHpdImrLock); fHpdImrLock = nullptr; }
+@@ -3729,10 +3884,6 @@ bool IntelXeFramebuffer::start(IOService *provider)
+ 	setProperty("IntelXeFBVram", fDpa, 64);
+ 	setProperty("IntelXeFBScanoutVersion", 4ull, 32);   // NMXScanout 2 (adaptive-sync window), 3 (DPA runs), 4 (vblank phase)
+ 	publishFlipWait();
+-	if (IODeviceMemory *sm = IODeviceMemory::withRange(fSurfPhys, (IOPhysicalLength)fRowBytes * fHeight)) {
+-		fSurfMap = sm->map(kIOMapWriteCombineCache); sm->release();
+-	}
+-	if (!fSurfMap) FBLOG("the surface would not map write-combined: no accelerated frames for this display");
+ 	armVbl();
+ 	fHpdCall = thread_call_allocate(hpdFire, this);                    // before the hotplug interrupt is unmasked
+ 	fHpdReenableCall = thread_call_allocate(hpdReenableFire, this);
+@@ -3810,8 +3961,8 @@ void IntelXeFramebuffer::stop(IOService *provider)
+ 	// no hotplug interrupt reaches hpdIrq after irqRegister(false) (IntelXe.kext: none in flight once unregistered)
+ 	if (fHpdCall) { thread_call_cancel(fHpdCall); while (!thread_call_free(fHpdCall)) { thread_call_cancel(fHpdCall); IOSleep(5); } fHpdCall = nullptr; }
+ 	if (fHpdReenableCall) { thread_call_cancel(fHpdReenableCall); while (!thread_call_free(fHpdReenableCall)) { thread_call_cancel(fHpdReenableCall); IOSleep(5); } fHpdReenableCall = nullptr; }
+-	if (fRegs && fShpdFilterBoot != ~0u) wr(SHPD_FILTER_CNT, fShpdFilterBoot);   // the firmware's debounce back
+-	if (fRegs && fPipe >= 0) { dispLock(); vrrDisableLocked("stop"); programPixelClock(fPclk); dispUnlock(); }   // fixed refresh at the firmware's clock
++	if (fDisplayVer >= 14 && fRegs && fShpdFilterBoot != ~0u) wr(SHPD_FILTER_CNT, fShpdFilterBoot);   // the firmware's debounce back
++	if (fDisplayVer >= 14 && fRegs && fPipe >= 0) { dispLock(); vrrDisableLocked("stop"); programPixelClock(fPclk); dispUnlock(); }   // fixed refresh at the firmware's clock
+ 	if (fCurReady) {   // cursor plane off (and its DDB/watermark back to the firmware's zero), then its GGTT window goes
+ 		cursorPark(true);
+ 		wr(CUR_WM(fPipe, 0), 0); wr(CUR_BUF_CFG(fPipe), 0); wr(CURBASE(fPipe), kCurGgtt);
+@@ -3884,7 +4035,7 @@ int IntelXeFramebuffer::auxXfer(uint32_t ctl, const uint8_t *tx, uint32_t txn, u
+ {
+ 	if (txn > 20 || rxmax > 20) return -1;
+ 	uint32_t send = AUX_SEND_BUSY | AUX_DONE | AUX_TIME_OUT_ERROR | AUX_TIME_OUT_MAX | AUX_RECEIVE_ERROR |
+-	                (txn << 20) | AUX_SYNC | AUX_POWER_REQUEST;
++	                (txn << 20) | AUX_SYNC | (fDisplayVer >= 14 ? AUX_POWER_REQUEST : 0u);
+ 	uint32_t status = 0;
+ 	for (int t = 0; t < 5; t++) {
+ 		for (uint32_t i = 0; i < txn; i += 4) {
+@@ -4005,7 +4156,41 @@ bool IntelXeFramebuffer::readEdidInto(uint32_t ctl, uint8_t *edid, uint32_t *edi
+ // put back as it was. Without an EDID the display is published unnamed with the one adopted mode.
+ void IntelXeFramebuffer::probeEdid()
+ {
+-	uint32_t port = (rd(TRANS_DDI_FUNC_CTL(fPipe)) >> 27) & 0xF;   // 1 + enum port (A 0, B 1, TC1 3 ...)
++	uint32_t port = (rd(TRANS_DDI_FUNC_CTL(fPipe)) >> 27) & 0xF;   // 1 + enum port (A 0, B 1, C 2, TC1 3, D_XELPD 7)
++	if (fDisplayVer < 14) {
++		// DG2 Display 13: TRANS_DDI_FUNC_CTL 30:27 -> A(1), B(2), C(3), USBC1/TC1(4), D(8)
++		int first = port == 1 ? 0 : port == 2 ? 1 : port == 3 ? 2 : port == 4 ? 3 : port == 8 ? 4 : -1;
++		fHpdPin = 0;
++		for (int k = -1; k < 5; k++) {
++			int a = k < 0 ? first : k;
++			if (a < 0 || (k >= 0 && a == first)) continue;
++			const uint32_t ctl = kAuxCtlDg2[a];
++			const int pwIdx = kAuxPwIdxDg2[a];
++			const uint32_t pwReq = intelxeplan::pwReq(pwIdx), pwState = intelxeplan::pwState(pwIdx);
++			bool auxReq = false;
++			if (!((rd(ICL_PWR_WELL_CTL_AUX1) | rd(ICL_PWR_WELL_CTL_AUX2)) & pwState)) {
++				wr(ICL_PWR_WELL_CTL_AUX2, rd(ICL_PWR_WELL_CTL_AUX2) | pwReq);
++				for (int t = 0; t < 40 && !(rd(ICL_PWR_WELL_CTL_AUX2) & pwState); t++) IODelay(50);
++				auxReq = true;
++			}
++			bool ok = readEdid(ctl);
++			if (auxReq) wr(ICL_PWR_WELL_CTL_AUX2, rd(ICL_PWR_WELL_CTL_AUX2) & ~pwReq);
++			if (ok) {
++				char name[14] = "";
++				for (int d = 54; d <= 108; d += 18)   // the monitor-name descriptor (tag 0xFC)
++					if (!fEdid[d] && !fEdid[d + 1] && fEdid[d + 3] == 0xFC) {
++						for (int i = 0; i < 13 && fEdid[d + 5 + i] != 0x0A; i++) name[i] = (char)fEdid[d + 5 + i];
++						break;
++					}
++				FBLOG("edid: %u bytes on DG2 AUX %s (0x%x, DDI port select %u), monitor \"%s\"", fEdidLen, kAuxNameDg2[a], ctl, port, name);
++				setProperty("IntelXeFBEdidAux", kAuxNameDg2[a]);
++				fAux = ctl;
++				return;
++			}
++		}
++		FBLOG("edid: no reply on any DG2 AUX channel (DDI port select %u); using GOP mode", port);
++		return;
++	}
+ 	int first = port == 1 ? 0 : port == 2 ? 1 : (port >= 4 && port <= 7) ? (int)port - 2 : -1;
+ 	// the panel's HPD pin (encoder->hpd_pin, hpd_mtp): DDI A/B -> SDE 16/17, TC1-4 -> SDE 24-27
+ 	fHpdPin = port == 1 ? 1u << 16 : port == 2 ? 1u << 17 : (port >= 4 && port <= 7) ? 1u << (24 + port - 4) : 0;
+@@ -4062,9 +4247,10 @@ void IntelXeFramebuffer::buildModes()
+ 	pn.width = fWidth; pn.height = fHeight; pn.htotal = fHT; pn.vtotal = fVT; pn.pclkHz = fPclk;
+ 	pn.hsyncStart = fHSS; pn.hsyncEnd = fHSE; pn.vsyncStart = fVSS; pn.vsyncEnd = fVSE;
+ 	pn.vrr = fVrrCapable && fVrrAllowed; pn.vrrMin = (int)fVrrMinHz; pn.vrrMax = (int)fVrrMaxHz;
++	if (fDisplayVer < 14) { fScaling = false; fRates = false; fCommonRates = false; }
+ 	pn.scaling = fScaling; pn.rates = fRates; pn.commonRates = fCommonRates; pn.maxVtotal = 8192;
+ 	pn.edid = fEdidParse;
+-	if (fEdidParse && fEdidParse->count) {
++	if (fDisplayVer >= 14 && fEdidParse && fEdidParse->count) {
+ 		const uint32_t ddi = fPipe >= 0 ? rd(TRANS_DDI_FUNC_CTL(fPipe)) : 0, sel = (ddi >> 27) & 0xF, w = (ddi >> 1) & 7;
+ 		intelxeedid::Sink sk = {};
+ 		sk.maxDotclk = 1305600;   // intel_cdclk.c:3401: 2 pixels/clock x 652800 kHz (display 11+, 38.4 MHz ref)
+@@ -4074,7 +4260,7 @@ void IntelXeFramebuffer::buildModes()
+ 			uint8_t bw = 0;
+ 			sk.linkRate = dpcd(0x100, &bw, 1, false) == 0 && bw ? bw * 27000 : 810000;
+ 		}
+-		sk.bpp = 24; sk.interlace = false; sk.ycbcr420 = false; sk.displayVer = 14;
++		sk.bpp = 24; sk.interlace = false; sk.ycbcr420 = false; sk.displayVer = fDisplayVer;
+ 		intelxeedid::Mode *valid = (intelxeedid::Mode *)IOMallocZero(sizeof(intelxeedid::Mode) * intelxeedid::kMaxModes);
+ 		if (valid) {
+ 			int nv = 0;
+@@ -4482,6 +4668,7 @@ void IntelXeFramebuffer::planLive(intelxeplan::LiveState *s, int pipeB) const
+ 	const int p = fPipe;
+ 	*s = {};
+ 	s->pipeA = p;
++	if (fDisplayVer < 14 || p < 0 || !fRegs) return;
+ 	s->htotal = rd(TR_(p, 0x60000)); s->hblank = rd(TR_(p, 0x60004)); s->hsync = rd(TR_(p, 0x60008));
+ 	s->vtotal = rd(TR_(p, 0x6000C)); s->vblank = rd(TR_(p, 0x60010)); s->vsync = rd(TR_(p, 0x60014));
+ 	s->scl = rd(TRANS_SET_CONTEXT_LATENCY(p)); s->pipesrc = rd(TR_(p, 0x6001C)); s->funcCtl = rd(TRANS_DDI_FUNC_CTL(p));
+@@ -4558,7 +4745,7 @@ bool IntelXeFramebuffer::connMode(Conn &c, intelxeedid::Result *res)
+ void IntelXeFramebuffer::connScan()
+ {
+ 	using namespace intelxeplan;
+-	if (!fRegs || fPipe < 0) return;
++	if (fDisplayVer < 14 || !fRegs || fPipe < 0) return;
+ 	const uint32_t live = rd(SDEISR);
+ 	const uint32_t sel = (rd(TRANS_DDI_FUNC_CTL(fPipe)) >> 27) & 0xF;
+ 	intelxeedid::Result *res = (intelxeedid::Result *)IOMallocZero(sizeof(intelxeedid::Result));
+@@ -4661,6 +4848,7 @@ void IntelXeFramebuffer::pipeBSurfaceFree()
+ bool IntelXeFramebuffer::pmdemandProgram(uint32_t r0, uint32_t r1, const char *why)
+ {
+ 	using namespace intelxeplan;
++	if (fDisplayVer < 14 || !fRegs) return false;
+ 	auto clear = [this](uint32_t off, uint32_t bit) { for (int t = 0; t < 200; t++) { if (!(rd(off) & bit)) return true; IODelay(50); } return false; };
+ 	if (!clear(PMDEMAND1, PMDEMAND_REQ) || !clear(DCPR_STATUS_1, PMDEMAND_INFLIGHT)) { FBLOG("pmdemand (%s): a request is still in flight", why); return false; }
+ 	const uint32_t c0 = rd(PMDEMAND0), c1 = rd(PMDEMAND1);
+@@ -4739,6 +4927,7 @@ void IntelXeFramebuffer::pipeBGlobalsBack(int pipeB)
+ int IntelXeFramebuffer::pipeBOn(const char *why)
+ {
+ 	using namespace intelxeplan;
++	if (fDisplayVer < 14) return ENOTSUP;
+ 	if (!fPipeBAllowed) return EPERM;
+ 	if (!fRegs || fPipe < 0 || fStopping) return ENODEV;
+ 	if (fPipeB >= 0) return 0;
+@@ -4837,7 +5026,7 @@ int IntelXeFramebuffer::pipeBOn(const char *why)
+ int IntelXeFramebuffer::pipeBOff(const char *why, bool tellFb)
+ {
+ 	using namespace intelxeplan;
+-	if (fPipeB < 0) return 0;
++	if (fDisplayVer < 14 || fPipeB < 0) return 0;
+ 	const int pb = fPipeB;
+ 	if (fSecond && tellFb) fSecond->setConnected(false);
+ 	dispLock();
+@@ -4927,7 +5116,7 @@ void IntelXeFramebuffer::pipeBBlank(bool off)
+ // for a new one
+ void IntelXeFramebuffer::pipeBWork()
+ {
+-	if (fStopping || !fPipeBAllowed || fPipe < 0 || fSysSuspended || !fPipeBLock) return;
++	if (fDisplayVer < 14 || fStopping || !fPipeBAllowed || fPipe < 0 || fSysSuspended || !fPipeBLock) return;
+ 	IOSleep(500);   // a sink's AUX after its hotplug pulse (replugFire waits as long)
+ 	if (fStopping) return;
+ 	IOLockLock(fPipeBLock);
+@@ -4949,6 +5138,7 @@ void IntelXeFramebuffer::pipeBWork()
+ // debug.intelxefb_pipeb: 1 scan + light, 0 off, 2 scan only
+ int IntelXeFramebuffer::pipeBCommand(int v)
+ {
++	if (fDisplayVer < 14) return ENOTSUP;
+ 	if (!fPipeBAllowed || !fPipeBLock) return EPERM;
+ 	IOLockLock(fPipeBLock);
+ 	int r = 0;
+@@ -4970,6 +5160,7 @@ int IntelXeFramebuffer::pipeBPlanText(char *b, int n)
+ 	Txt t = { b, n, 0 };
+ 	b[0] = 0;
+ 	if (!fRegs || fPipe < 0) { t.p("no pipe adopted\n"); return t.len; }
++	if (fDisplayVer < 14) { t.p("second-pipe plan: Display 14+ only (current display %u)\n", fDisplayVer); return t.len; }
+ 	LiveState *s = (LiveState *)IOMallocZero(sizeof(LiveState));
+ 	Plan *pl = (Plan *)IOMallocZero(sizeof(Plan));
+ 	if (!s || !pl) { if (s) IOFree(s, sizeof *s); if (pl) IOFree(pl, sizeof *pl); t.p("no memory\n"); return t.len; }
